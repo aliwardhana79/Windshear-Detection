@@ -56,6 +56,8 @@ import warnings
 import io
 import base64
 import contextlib
+import os
+import tempfile
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -87,10 +89,10 @@ INTERVAL_MIN = 10
 INPUT_DIR = Path(
     "/Users/aliwardhana/Downloads/Training_TL/00_data/Himawari_9/20250307"
 )
-OUTPUT_DIR = Path(
-    "/Users/aliwardhana/Downloads/Training_TL/01_output/Himawari_9/CTV699_20250307_Dense_AMV"
-)
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR = Path(os.environ.get(
+    "WINDSHEAR_OUTPUT_DIR",
+    str(Path(tempfile.gettempdir()) / "windshear_agent" / "dense_amv"),
+)).expanduser()
 
 # CTV699 / Juanda domain
 LON_MIN, LON_MAX = 112.0, 113.5
@@ -959,6 +961,7 @@ def plot_qc_diagnostics(result: dict, t_mid: datetime):
 # =============================================================================
 
 def main():
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     print("=" * 78)
     print("HIMAWARI-9 DENSE GRID CMV / AMV-LIKE ANALYSIS — CTV699")
     print("=" * 78)
@@ -1089,7 +1092,7 @@ def process_uploaded_sequence(files, output_dir=None):
         old_output = OUTPUT_DIR
         if output_dir:
             OUTPUT_DIR = Path(output_dir).expanduser().resolve()
-            OUTPUT_DIR.mkdir(parents=True,exist_ok=True)
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         products=[]
         try:
             for index in range(1,len(times)-1):
