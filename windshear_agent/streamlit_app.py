@@ -7,6 +7,7 @@ import json
 import os
 import csv
 import tempfile
+import zipfile
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -70,6 +71,24 @@ st.warning("Advisory and research only. Derived radar and satellite products are
 
 def uploaded_pairs(files):
     return [(f.name, f.getvalue()) for f in files]
+
+
+def zip_cropped_scenes(result):
+    """Package downloaded and already-present cropped NetCDF scenes for browser download."""
+    output_dir = Path(result["output_dir"])
+    names = list(dict.fromkeys(result.get("cropped_downloaded", []) + result.get("already_existing", [])))
+    archive = io.BytesIO()
+    added = 0
+    with zipfile.ZipFile(archive, mode="w", compression=zipfile.ZIP_STORED) as bundle:
+        for name in names:
+            path = output_dir / Path(name).name
+            if path.is_file():
+                bundle.write(path, arcname=path.name)
+                added += 1
+    if not added:
+        return None
+    archive.seek(0)
+    return archive.getvalue()
 
 
 def show_b64_image(value, caption=None):
@@ -198,6 +217,14 @@ def satellite_tab():
                     progress.progress(min(100, int(p.get("percent", 0))), text=f"{p.get('stage', '')} · {p.get('current_time', '')}")
                 result = download_himawari(username, password, start.strftime("%Y%m%d%H%M"), end.strftime("%Y%m%d%H%M"), [[south, west], [south, east], [north, east], [north, west]], output_dir, interval, update)
                 st.success(f"Saved {len(result['cropped_downloaded'])} cropped scene(s) to {result['output_dir']}")
+                archive = zip_cropped_scenes(result)
+                if archive:
+                    st.session_state["hima_cropped_zip"] = archive
+                    st.session_state["hima_cropped_zip_name"] = f"himawari_roi_{start:%Y%m%d_%H%M}_{end:%Y%m%d_%H%M}.zip"
+                    st.session_state["hima_cropped_zip_count"] = len(result.get("cropped_downloaded", [])) + len(result.get("already_existing", []))
+                else:
+                    st.session_state.pop("hima_cropped_zip", None)
+                    st.warning("No cropped scene files were available to package for download.")
                 st.json({k: v for k, v in result.items() if k not in ("full_disk_files",)})
             except Exception as exc:
                 st.error(f"Download failed: {exc}")
@@ -205,9 +232,18 @@ def satellite_tab():
                 # Streamlit widget values live only for this browser session;
                 # avoid logging or persisting submitted credentials elsewhere.
                 pass
+    if "hima_cropped_zip" in st.session_state:
+        st.download_button(
+            f"Download {st.session_state['hima_cropped_zip_count']} cropped scene(s) (.zip)",
+            data=st.session_state["hima_cropped_zip"],
+            file_name=st.session_state["hima_cropped_zip_name"],
+            mime="application/zip",
+            key="download_hima_zip",
+            help="Downloads the regional cropped NetCDF scenes as one ZIP file.",
+        )
 
     st.markdown("#### Plot one NetCDF field")
-    single = st.file_uploader("Himawari NetCDF (.nc/.nc4/.cdf)", type=NC_TYPES, key="sat_single")
+    single = st.file_uploader("Himawari NetCDF (.nc/.nc4/.cdf)", type=NC_TYPES, key="sat_single", max_upload_size=800)
     variable = st.text_input("Variable name (optional; auto-select Band 13 where available)")
     if st.button("Plot satellite field", key="plot_sat"):
         if not single:
@@ -226,8 +262,8 @@ def satellite_tab():
 
     st.markdown("#### Two-scene feature-motion approximation")
     c1, c2 = st.columns(2)
-    earlier = c1.file_uploader("Earlier scene", type=NC_TYPES, key="motion_1")
-    later = c2.file_uploader("Later scene (10 minutes after)", type=NC_TYPES, key="motion_2")
+    earlier = c1.file_uploader("Earlier scene", type=NC_TYPES, key="motion_1", max_upload_size=800)
+    later = c2.file_uploader("Later scene (10 minutes after)", type=NC_TYPES, key="motion_2", max_upload_size=800)
     if st.button("Estimate motion for Bands 3, 7 and 13", key="run_motion"):
         if not earlier or not later:
             st.error("Choose both scenes.")
@@ -245,7 +281,7 @@ def satellite_tab():
                 st.error(f"Motion estimate failed: {exc}")
 
     st.markdown("#### Dense cloud-motion vectors")
-    dense = st.file_uploader("Select at least 3 consecutive scenes, exactly 10 minutes apart", type=NC_TYPES, accept_multiple_files=True, key="dense_files")
+    dense = st.file_uploader("Select at least 3 consecutive scenes, exactly 10 minutes apart", type=NC_TYPES, accept_multiple_files=True, key="dense_files", max_upload_size=800)
     if st.button("Process dense motion sequence", key="run_dense"):
         if len(dense or []) < 3: st.error("Select at least three scenes.")
         else:
@@ -260,7 +296,7 @@ def satellite_tab():
             except Exception as exc: st.error(f"Dense motion failed: {exc}")
 
     st.markdown("#### Convective cooling / cold-cloud evolution")
-    cooling_files = st.file_uploader("Select 2–15 scenes with matching coverage", type=NC_TYPES, accept_multiple_files=True, key="cooling_files")
+    cooling_files = st.file_uploader("Select 2–15 scenes with matching coverage", type=NC_TYPES, accept_multiple_files=True, key="cooling_files", max_upload_size=800)
     if st.button("Process cooling sequence", key="run_cooling"):
         if len(cooling_files or []) < 2: st.error("Select at least two scenes.")
         else:
