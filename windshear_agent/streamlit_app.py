@@ -96,6 +96,7 @@ def zip_cropped_scenes(result):
 
 def make_analysis_docx(text):
     """Build a small Word-compatible DOCX using only the Python standard library."""
+    import re
     document = [
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
         '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">',
@@ -103,7 +104,34 @@ def make_analysis_docx(text):
         '<w:p><w:pPr><w:pStyle w:val="Title"/></w:pPr><w:r><w:t>Comprehensive Aviation Weather Analysis</w:t></w:r></w:p>',
     ]
     for line in text.splitlines() or [""]:
-        document.append('<w:p><w:r><w:t xml:space="preserve">' + escape(line) + '</w:t></w:r></w:p>')
+        leading = len(line) - len(line.lstrip(" "))
+        content = line.lstrip(" ")
+        paragraph_properties = []
+        if leading:
+            paragraph_properties.append(f'<w:ind w:left="{min(leading * 180, 3600)}"/>')
+        match = re.match(r"^(\d+)[.)]\s+(.*)$", content)
+        if match:
+            rendered = f"{match.group(1)}. {match.group(2)}"
+            paragraph_properties.append('<w:pStyle w:val="ListParagraph"/>')
+        elif content.startswith(("- ", "* ")):
+            rendered = "•  " + content[2:]
+            paragraph_properties.append('<w:pStyle w:val="ListParagraph"/>')
+        elif content.startswith("### "):
+            rendered = content[4:]
+            paragraph_properties.append('<w:pStyle w:val="Heading2"/>')
+        elif content.startswith("## "):
+            rendered = content[3:]
+            paragraph_properties.append('<w:pStyle w:val="Heading1"/>')
+        elif content.startswith("# "):
+            rendered = content[2:]
+            paragraph_properties.append('<w:pStyle w:val="Heading1"/>')
+        elif content.startswith("> "):
+            rendered = content[2:]
+            paragraph_properties.append('<w:ind w:left="720"/>')
+        else:
+            rendered = content
+        ppr = '<w:pPr>' + ''.join(paragraph_properties) + '</w:pPr>' if paragraph_properties else ''
+        document.append('<w:p>' + ppr + '<w:r><w:t xml:space="preserve">' + escape(rendered) + '</w:t></w:r></w:p>')
     document.extend([
         '<w:p><w:r><w:rPr><w:i/></w:rPr><w:t>Advisory/research only. Not an operational warning or flight-deck decision.</w:t></w:r></w:p>',
         '<w:sectPr><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"/></w:sectPr>',
@@ -770,7 +798,20 @@ def comprehensive_tab():
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
     st.markdown("#### Your written analysis")
-    st.caption("Write or edit your narrative here. It stays in this browser session and is included in the downloaded Word document.")
+    st.caption("Use the formatting controls to insert Markdown headings, numbered/bulleted items, and indented paragraphs. Preview and Word download use that formatting.")
+
+    def append_analysis_snippet(snippet):
+        current = st.session_state.get("comprehensive_analysis_text", "")
+        if current and not current.endswith("\n"):
+            current += "\n"
+        st.session_state["comprehensive_analysis_text"] = current + snippet
+
+    t1, t2, t3, t4, t5 = st.columns(5)
+    t1.button("Heading", key="analysis_insert_heading", on_click=append_analysis_snippet, args=("## Heading\n",))
+    t2.button("Numbered item", key="analysis_insert_number", on_click=append_analysis_snippet, args=("1. Numbered item\n",))
+    t3.button("Next number", key="analysis_insert_next_number", on_click=append_analysis_snippet, args=("2. Numbered item\n",))
+    t4.button("Bullet item", key="analysis_insert_bullet", on_click=append_analysis_snippet, args=("- Bullet item\n",))
+    t5.button("Indent paragraph", key="analysis_insert_indent", on_click=append_analysis_snippet, args=("    Indented paragraph\n",))
     analysis_text = st.text_area(
         "Comprehensive analysis notes",
         key="comprehensive_analysis_text",
@@ -778,6 +819,8 @@ def comprehensive_tab():
         placeholder="Enter the event context, observations, source-by-source interpretation, time/location alignment, uncertainty, and follow-up checks…",
     )
     if analysis_text.strip():
+        with st.expander("Formatted preview", expanded=True):
+            st.markdown(analysis_text)
         st.download_button(
             "Save analysis as Word document (.docx)",
             data=make_analysis_docx(analysis_text),
