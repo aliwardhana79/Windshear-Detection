@@ -8,6 +8,7 @@ import os
 import csv
 import tempfile
 import zipfile
+from xml.sax.saxutils import escape
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -89,6 +90,38 @@ def zip_cropped_scenes(result):
                 added += 1
     if not added:
         return None
+    archive.seek(0)
+    return archive.getvalue()
+
+
+def make_analysis_docx(text):
+    """Build a small Word-compatible DOCX using only the Python standard library."""
+    document = [
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">',
+        '<w:body>',
+        '<w:p><w:pPr><w:pStyle w:val="Title"/></w:pPr><w:r><w:t>Comprehensive Aviation Weather Analysis</w:t></w:r></w:p>',
+    ]
+    for line in text.splitlines() or [""]:
+        document.append('<w:p><w:r><w:t xml:space="preserve">' + escape(line) + '</w:t></w:r></w:p>')
+    document.extend([
+        '<w:p><w:r><w:rPr><w:i/></w:rPr><w:t>Advisory/research only. Not an operational warning or flight-deck decision.</w:t></w:r></w:p>',
+        '<w:sectPr><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"/></w:sectPr>',
+        '</w:body></w:document>',
+    ])
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as docx:
+        docx.writestr("[Content_Types].xml", '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>''')
+        docx.writestr("_rels/.rels", '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>''')
+        docx.writestr("word/document.xml", "".join(document))
     archive.seek(0)
     return archive.getvalue()
 
@@ -735,6 +768,23 @@ def comprehensive_tab():
             details = f"Attach above or use {menu}"
         rows.append({"Source": label, "Status": status, "Details": details})
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    st.markdown("#### Your written analysis")
+    st.caption("Write or edit your narrative here. It stays in this browser session and is included in the downloaded Word document.")
+    analysis_text = st.text_area(
+        "Comprehensive analysis notes",
+        key="comprehensive_analysis_text",
+        height=300,
+        placeholder="Enter the event context, observations, source-by-source interpretation, time/location alignment, uncertainty, and follow-up checks…",
+    )
+    if analysis_text.strip():
+        st.download_button(
+            "Save analysis as Word document (.docx)",
+            data=make_analysis_docx(analysis_text),
+            file_name=f"comprehensive_analysis_{date.today().isoformat()}.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            key="download_comprehensive_docx",
+        )
 
     if not any(row["Status"] == "Analyzed / available" for row in rows):
         st.info("No source analysis results are available yet. Files attached above are inventoried only; run the relevant source analysis to generate summaries.")
