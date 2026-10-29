@@ -444,12 +444,39 @@ LLWAS_STATIONS = [
 ]
 
 
+def load_kkop_lines():
+    """Load packaged KKOP boundaries as Leaflet [lat, lon] polyline arrays."""
+    path = Path(__file__).parent / "assets" / "kkop.geojson"
+    if not path.is_file():
+        return []
+    try:
+        collection = json.loads(path.read_text(encoding="utf-8"))
+        lines = []
+        for feature in collection.get("features", []):
+            geometry = feature.get("geometry") or {}
+            kind, coordinates = geometry.get("type"), geometry.get("coordinates", [])
+            if kind == "LineString":
+                candidates = [coordinates]
+            elif kind == "MultiLineString":
+                candidates = coordinates
+            else:
+                continue
+            for line in candidates:
+                points = [[float(point[1]), float(point[0])] for point in line if len(point) >= 2]
+                if len(points) >= 2:
+                    lines.append(points)
+        return lines
+    except (OSError, ValueError, TypeError, IndexError):
+        return []
+
+
 def show_llwas_station_map():
     import json
 
     stations_json = json.dumps([
         {"name": name, "lat": lat, "lon": lon} for name, lat, lon in LLWAS_STATIONS
     ])
+    kkop_json = json.dumps(load_kkop_lines())
     map_html = f"""<!doctype html>
 <html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -459,11 +486,14 @@ def show_llwas_station_map():
 </head><body><div id="map"></div>
 <script>
 const stations = {stations_json};
+const kkopLines = {kkop_json};
 const map = L.map('map').setView([-7.3797, 112.7873], 12);
 L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
   maxZoom: 19,
   attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
 }}).addTo(map);
+kkopLines.forEach(line => L.polyline(line, {{color:'#e32636', weight:3, opacity:0.95, dashArray:'8 5'}})
+  .addTo(map).bindPopup('<b>KKOP Juanda</b><br>Reference boundary'));
 stations.forEach(s => L.marker([s.lat, s.lon], {{
   icon: L.divIcon({{className:'station-dot', html:'▲', iconSize:[22,22], iconAnchor:[11,11]}})
 }}).addTo(map).bindPopup('<b>'+s.name+'</b><br>LLWAS reference location'));
@@ -473,12 +503,12 @@ L.marker([-7.3797, 112.7873], {{
 L.control.scale({{metric:true, imperial:false}}).addTo(map);
 L.control({{position:'topright'}}).onAdd = function() {{
   const div = L.DomUtil.create('div','legend');
-  div.innerHTML = '<span style="color:#1769aa">▲</span> LLWAS station<br><span style="color:#d62728">★</span> Juanda Airport';
+  div.innerHTML = '<span style="color:#1769aa">▲</span> LLWAS station<br><span style="color:#d62728">★</span> Juanda Airport<br><span style="color:#e32636">━ ━</span> KKOP boundary';
   return div;
 }}.addTo(map);
 </script></body></html>"""
     components.html(map_html, height=540, scrolling=False)
-    st.caption("Map tiles require an internet connection and are provided by OpenStreetMap. Station markers show static reference locations digitized from the [user-provided Google My Maps layer](https://www.google.com/maps/d/viewer?mid=1qYkHx_INlEsNiOI2Pn4jjgvwfLZA7aZG&hl=en&usp=sharing); they do not display live winds.")
+    st.caption("Map tiles require an internet connection and are provided by OpenStreetMap. LLWAS markers are static locations digitized from the [user-provided Google My Maps layer](https://www.google.com/maps/d/viewer?mid=1qYkHx_INlEsNiOI2Pn4jjgvwfLZA7aZG&hl=en&usp=sharing); the red dashed line is the KKOP reference boundary from the supplied GeoJSON. Neither layer displays live winds.")
 
 
 def surface_tab():
