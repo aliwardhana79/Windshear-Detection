@@ -17,6 +17,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 st.set_page_config(page_title="Windshear Agent · Juanda", page_icon="🌦️", layout="wide")
 
@@ -418,27 +419,40 @@ LLWAS_STATIONS = [
 
 
 def show_llwas_station_map():
-    fig, ax = plt.subplots(figsize=(10, 7))
-    lats = [station[1] for station in LLWAS_STATIONS]
-    lons = [station[2] for station in LLWAS_STATIONS]
-    ax.scatter(lons, lats, s=75, c="#1769aa", edgecolors="white", linewidths=1.2,
-               marker="^", zorder=3, label="LLWAS station (reference location)")
-    for name, lat, lon in LLWAS_STATIONS:
-        ax.annotate(name, (lon, lat), xytext=(6, 5), textcoords="offset points", fontsize=8)
-    ax.scatter([112.7873], [-7.3797], marker="*", s=180, c="#d62728", edgecolors="white",
-               linewidths=0.8, zorder=4, label="Juanda Airport (reference)")
-    ax.set_xlim(min(lons) - 0.012, max(lons) + 0.020)
-    ax.set_ylim(min(lats) - 0.012, max(lats) + 0.012)
-    ax.set_xlabel("Longitude (°E)")
-    ax.set_ylabel("Latitude (°; south is negative)")
-    ax.set_title("Juanda LLWAS station locations")
-    ax.grid(True, alpha=0.3)
-    ax.set_aspect(1 / np.cos(np.deg2rad(np.mean(lats))))
-    ax.legend(loc="best")
-    fig.tight_layout()
-    st.pyplot(fig, use_container_width=True)
-    plt.close(fig)
-    st.caption("Static station locations digitized from the user-provided Google My Maps layer; markers show sensor locations, not live wind observations. [Open source map](https://www.google.com/maps/d/viewer?mid=1qYkHx_INlEsNiOI2Pn4jjgvwfLZA7aZG&hl=en&usp=sharing).")
+    import json
+
+    stations_json = json.dumps([
+        {"name": name, "lat": lat, "lon": lon} for name, lat, lon in LLWAS_STATIONS
+    ])
+    map_html = f"""<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>html,body,#map{{height:100%;width:100%;margin:0}} .legend{{background:white;padding:7px 10px;border-radius:4px;font:13px Arial;line-height:1.7;box-shadow:0 1px 5px #777}} .station-dot{{color:#1769aa;font-size:24px;font-weight:bold;line-height:20px;text-shadow:0 0 3px white}} .airport-star{{color:#d62728;font-size:23px;text-shadow:0 0 3px white}}</style>
+</head><body><div id="map"></div>
+<script>
+const stations = {stations_json};
+const map = L.map('map').setView([-7.3797, 112.7873], 12);
+L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+  maxZoom: 19,
+  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+}}).addTo(map);
+stations.forEach(s => L.marker([s.lat, s.lon], {{
+  icon: L.divIcon({{className:'station-dot', html:'▲', iconSize:[22,22], iconAnchor:[11,11]}})
+}}).addTo(map).bindPopup('<b>'+s.name+'</b><br>LLWAS reference location'));
+L.marker([-7.3797, 112.7873], {{
+  icon: L.divIcon({{className:'airport-star', html:'★', iconSize:[24,24], iconAnchor:[12,12]}})
+}}).addTo(map).bindPopup('<b>Juanda Airport</b> (reference)');
+L.control.scale({{metric:true, imperial:false}}).addTo(map);
+L.control({{position:'topright'}}).onAdd = function() {{
+  const div = L.DomUtil.create('div','legend');
+  div.innerHTML = '<span style="color:#1769aa">▲</span> LLWAS station<br><span style="color:#d62728">★</span> Juanda Airport';
+  return div;
+}}.addTo(map);
+</script></body></html>"""
+    components.html(map_html, height=540, scrolling=False)
+    st.caption("Map tiles require an internet connection and are provided by OpenStreetMap. Station markers show static reference locations digitized from the [user-provided Google My Maps layer](https://www.google.com/maps/d/viewer?mid=1qYkHx_INlEsNiOI2Pn4jjgvwfLZA7aZG&hl=en&usp=sharing); they do not display live winds.")
 
 
 def surface_tab():
