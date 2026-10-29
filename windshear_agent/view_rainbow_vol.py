@@ -21,7 +21,7 @@ import wradlib.io as wio
 
 RADAR_LON, RADAR_LAT = 112.760422, -7.410306
 TRAINING_ROOT = Path("/Users/aliwardhana/Downloads/Training_TL")
-KKOP_GEOJSON = TRAINING_ROOT / "00_data/KKOP/kkop.geojson"
+KKOP_GEOJSON = Path(__file__).parent / "assets" / "kkop.geojson"
 
 
 def as_list(value):
@@ -158,7 +158,8 @@ def add_map_context(ax):
     except Exception as exc:
         print(f"Map coastline/admin context unavailable: {exc}")
     try:
-        with KKOP_GEOJSON.open(encoding="utf-8") as source:
+        kkop_path = KKOP_GEOJSON if KKOP_GEOJSON.is_file() else TRAINING_ROOT / "00_data/KKOP/kkop.geojson"
+        with kkop_path.open(encoding="utf-8") as source:
             collection = json.load(source)
         drew_kkop = False
         for feature in collection.get("features", []):
