@@ -636,8 +636,29 @@ def pilot_tab():
 
 def comprehensive_tab():
     st.subheader("Cross-source evidence overview")
-    st.caption("This page summarizes successful analyses from the other tabs in this browser session. It does not automatically fuse measurements into a forecast or operational decision.")
+    st.caption("Attach files here for the cross-source inventory, or analyze them in their dedicated tabs. Attachments here are not automatically processed or fused into a forecast or operational decision.")
     state = st.session_state
+    with st.expander("Attach source files", expanded=True):
+        st.caption("Files attached here appear in the Status table as attached, but must still be analyzed in the relevant source tab. Radar and satellite files may be large.")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            radar_upload = st.file_uploader("Radar volumes (.vol)", type=VOL_TYPES, accept_multiple_files=True, key="comprehensive_radar_files")
+            metar_upload = st.file_uploader("METAR/SPECI (.csv, .txt)", type=OBS_TYPES, key="comprehensive_metar_file")
+        with c2:
+            satellite_upload = st.file_uploader("Satellite scenes (.nc, .nc4, .cdf)", type=NC_TYPES, accept_multiple_files=True, key="comprehensive_satellite_files", max_upload_size=800)
+            llwas_upload = st.file_uploader("LLWAS observations (.csv)", type=CSV_TYPES, key="comprehensive_llwas_file")
+        with c3:
+            sounding_upload = st.file_uploader("Upper-air sounding (.csv)", type=CSV_TYPES, key="comprehensive_sounding_file")
+            pirep_upload = st.file_uploader("Pilot reports (.xls, .xlsx, .csv)", type=SHEET_TYPES, key="comprehensive_pirep_file")
+
+    attached = {
+        "Radar": [f.name for f in (radar_upload or [])],
+        "Satellite": [f.name for f in (satellite_upload or [])],
+        "Surface · METAR/SPECI": [metar_upload.name] if metar_upload else [],
+        "Surface · LLWAS": [llwas_upload.name] if llwas_upload else [],
+        "Upper air sounding": [sounding_upload.name] if sounding_upload else [],
+        "Pilot report": [pirep_upload.name] if pirep_upload else [],
+    }
     sources = [
         ("Radar", "comprehensive_radar", "Radar Analyze"),
         ("Satellite", ("comprehensive_satellite_field", "comprehensive_satellite_motion", "comprehensive_satellite_dense", "comprehensive_satellite_cooling"), "Satellite Analyze"),
@@ -649,12 +670,22 @@ def comprehensive_tab():
     rows = []
     for label, keys, menu in sources:
         keys = (keys,) if isinstance(keys, str) else keys
-        available = [key for key in keys if key in state]
-        rows.append({"Source": label, "Status": "Analyzed / available" if available else "Not yet analyzed", "Details": ", ".join(available) if available else f"Use {menu}"})
+        analyzed = [key for key in keys if key in state]
+        files = attached[label]
+        if analyzed:
+            status = "Analyzed / available"
+            details = "; ".join(str(state[key].get("file", ", ".join(state[key].get("files", [])))) for key in analyzed)
+        elif files:
+            status = "File attached · not analyzed"
+            details = ", ".join(files)
+        else:
+            status = "Not attached / analyzed"
+            details = f"Attach above or use {menu}"
+        rows.append({"Source": label, "Status": status, "Details": details})
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
     if not any(row["Status"] == "Analyzed / available" for row in rows):
-        st.info("Analyze or upload data in the source tabs first. Successful processing in this browser session will populate this overview.")
+        st.info("No source analysis results are available yet. Files attached above are inventoried only; run the relevant source analysis to generate summaries.")
 
     for title, key in (
         ("Radar analysis", "comprehensive_radar"),
