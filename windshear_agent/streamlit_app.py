@@ -355,7 +355,8 @@ def sounding_panel(prefix):
             if len(profile) < 5: raise ValueError(f"Only {len(profile)} valid pressure levels found.")
             profile["height_km"] = profile.z / 1000 if profile.z.notna().any() else 44330 * (1 - (profile.p / 1013.25) ** 0.1903) / 1000
             st.caption(f"{file.name} · {len(profile)} valid levels")
-            fig, ax = plt.subplots(figsize=(8, 8))
+            fig, ax = plt.subplots(figsize=(10, 8))
+            fig.subplots_adjust(left=0.10, right=0.76, bottom=0.10, top=0.90)
             ax.set_yscale("log"); ax.set_ylim(min(1050, profile.p.max()), max(10, profile.p.min()))
             ax.set_ylabel("Pressure (hPa)"); ax.set_xlabel("Temperature (°C; skewed x-coordinate)"); ax.grid(True, which="both", alpha=.3)
             for temp_col, color, label in (("T", "tab:red", "Temperature"), ("Td", "tab:green", "Dewpoint")):
@@ -365,6 +366,31 @@ def sounding_panel(prefix):
             ax2 = ax.twinx(); ticks = [1000, 900, 800, 700, 600, 500, 400, 300, 200, 100]
             ticks = [p for p in ticks if profile.p.min() <= p <= profile.p.max()]
             ax2.set_yscale("log"); ax2.set_ylim(ax.get_ylim()); ax2.set_yticks(ticks); ax2.set_yticklabels([f"{np.interp(p, profile.p[::-1], profile.height_km[::-1]):.1f}" for p in ticks]); ax2.set_ylabel("Height (km; approximate if not measured)")
+            wind = profile.dropna(subset=["ws", "wd", "p"]).copy()
+            wind = wind[(wind.ws >= 0) & (wind.wd >= 0) & (wind.wd <= 360)]
+            if not wind.empty:
+                # Thin very high-resolution soundings to a readable set of levels.
+                if len(wind) > 35:
+                    keep = np.linspace(0, len(wind) - 1, 35).round().astype(int)
+                    wind = wind.iloc[np.unique(keep)]
+                direction = np.deg2rad(wind.wd.to_numpy(dtype=float))
+                speed = wind.ws.to_numpy(dtype=float)
+                # Meteorological direction is the direction the wind comes from.
+                u = -speed * np.sin(direction)
+                v = -speed * np.cos(direction)
+                wind_ax = fig.add_axes([0.81, 0.10, 0.17, 0.80])
+                wind_ax.set_yscale("log")
+                wind_ax.set_ylim(ax.get_ylim())
+                wind_ax.set_xlim(0, 1.7)
+                wind_ax.set_xticks([])
+                wind_ax.tick_params(axis="y", left=False, labelleft=False, right=False, labelright=False)
+                for spine in wind_ax.spines.values(): spine.set_visible(False)
+                wind_ax.barbs(np.full(len(wind), 0.48), wind.p.to_numpy(dtype=float), u, v,
+                              length=5.5, linewidth=0.7, pivot="middle", barb_increments={"half": 2, "full": 4, "flag": 20})
+                for pressure, value in zip(wind.p.to_numpy(dtype=float), speed):
+                    wind_ax.annotate(f"{value:g}", (0.98, pressure), xycoords="data",
+                                     xytext=(2, 0), textcoords="offset points", va="center", fontsize=7)
+                wind_ax.set_title("Wind\nbarbs · m/s", fontsize=9, pad=5)
             st.pyplot(fig, use_container_width=True); plt.close(fig)
             charts = st.columns(3)
             for axis, value, title, color, limits in zip(charts, ["ws", "wd", "RH"], ["Wind speed (m/s)", "Wind direction (°)", "Relative humidity (%)"], ["tab:blue", "purple", "teal"], [(0, None), (0, 360), (0, 100)]):
