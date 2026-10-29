@@ -35,6 +35,7 @@ NC_TYPES = accept("nc", "nc4", "cdf")
 CSV_TYPES = accept("csv")
 OBS_TYPES = accept("csv", "txt", "metar", "speci")
 SHEET_TYPES = accept("xls", "xlsx", "csv")
+IMAGE_TYPES = accept("png", "jpg", "jpeg", "bmp", "webp", "tif", "tiff", "svg")
 
 
 def header_image_path():
@@ -639,16 +640,16 @@ def comprehensive_tab():
     st.caption("Attach files here for the cross-source inventory, or analyze them in their dedicated tabs. Attachments here are not automatically processed or fused into a forecast or operational decision.")
     state = st.session_state
     with st.expander("Attach source files", expanded=True):
-        st.caption("Files attached here appear in the Status table as attached, but must still be analyzed in the relevant source tab. Radar and satellite files may be large.")
+        st.caption("Image attachments appear in the Status table as attached, but are not decoded as source measurements. Use the dedicated source tabs to analyze raw radar, satellite, or sounding data.")
         c1, c2, c3 = st.columns(3)
         with c1:
-            radar_upload = st.file_uploader("Radar volumes (.vol)", type=VOL_TYPES, accept_multiple_files=True, key="comprehensive_radar_files")
+            radar_upload = st.file_uploader("Radar plot/image (.jpg, .jpeg, .png, .bmp, .svg, .webp, .tif)", type=IMAGE_TYPES, accept_multiple_files=True, key="comprehensive_radar_files")
             metar_upload = st.file_uploader("METAR/SPECI (.csv, .txt)", type=OBS_TYPES, key="comprehensive_metar_file")
         with c2:
-            satellite_upload = st.file_uploader("Satellite scenes (.nc, .nc4, .cdf)", type=NC_TYPES, accept_multiple_files=True, key="comprehensive_satellite_files", max_upload_size=800)
+            satellite_upload = st.file_uploader("Satellite image (.jpg, .jpeg, .png, .bmp, .svg, .webp, .tif)", type=IMAGE_TYPES, accept_multiple_files=True, key="comprehensive_satellite_files")
             llwas_upload = st.file_uploader("LLWAS observations (.csv)", type=CSV_TYPES, key="comprehensive_llwas_file")
         with c3:
-            sounding_upload = st.file_uploader("Upper-air sounding (.csv)", type=CSV_TYPES, key="comprehensive_sounding_file")
+            sounding_upload = st.file_uploader("Upper-air plot/image (.jpg, .jpeg, .png, .bmp, .svg, .webp, .tif)", type=IMAGE_TYPES, key="comprehensive_sounding_file")
             pirep_upload = st.file_uploader("Pilot reports (.xls, .xlsx, .csv)", type=SHEET_TYPES, key="comprehensive_pirep_file")
 
     attached = {
