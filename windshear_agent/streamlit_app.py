@@ -175,6 +175,14 @@ def radar_tab():
             try:
                 with st.spinner("Decoding, aligning and QC-filtering moments…"):
                     result = process_uploaded_volumes(volumes, display_moment=moment, thresholds=thresholds, attenuation_method=attenuation)
+                st.session_state["comprehensive_radar"] = {
+                    "files": [name for name, _ in volumes],
+                    "moments": result.get("available_moments", []),
+                    "display_moment": result.get("display_moment"),
+                    "attenuation_method": result.get("attenuation_method"),
+                    "sweeps": [{"elevation_deg": s.get("elevation_deg"), "range_max_km": s.get("range_max_km"), "statistics": s.get("statistics", {})} for s in result.get("sweeps", [])],
+                    "caveat": result.get("caveat", ""),
+                }
                 st.info(f"Moments: {', '.join(result['available_moments'])} · Display: {result['display_moment']} · attenuation: {result['attenuation_method']}")
                 st.warning(result["caveat"])
                 for sweep in result["sweeps"]:
@@ -253,6 +261,12 @@ def satellite_tab():
             try:
                 with st.spinner("Reading and plotting Juanda-area field…"):
                     out = process_satellite_file(single.name, single.getvalue(), variable)
+                st.session_state["comprehensive_satellite_field"] = {
+                    "file": out.get("filename"), "variable": out.get("variable"),
+                    "long_name": out.get("long_name"), "units": out.get("units"),
+                    "grid_shape": out.get("grid_shape"), "region": out.get("region"),
+                    "statistics": out.get("statistics"), "caveat": out.get("caveat", ""),
+                }
                 st.caption(f"{out['filename']} · {out['variable']} · {out['long_name']} · {out['units']} · grid {out['grid_shape']}")
                 show_b64_image(out["preview"]["png_base64"])
                 st.json(out["statistics"])
@@ -272,6 +286,11 @@ def satellite_tab():
             try:
                 with st.spinner("Tracking image features…"):
                     result = process_motion_files(uploaded_pairs([earlier, later]))
+                st.session_state["comprehensive_satellite_motion"] = {
+                    "files": [earlier.name, later.name],
+                    "bands": [{k: v for k, v in band.items() if k not in ("preview",)} for band in result.get("bands", [])],
+                    "caveat": result.get("caveat", ""),
+                }
                 st.warning(result["caveat"])
                 for band in result["bands"]:
                     st.markdown(f"**Band {band['band']} · {band['variable']} · {band['time_delta_minutes']} minute interval**")
@@ -289,6 +308,11 @@ def satellite_tab():
             try:
                 with st.spinner("Calculating dense cloud motion…"):
                     result = process_uploaded_sequence(uploaded_pairs(dense))
+                st.session_state["comprehensive_satellite_dense"] = {
+                    "files": [f.name for f in dense], "scenes": result.get("scenes"),
+                    "products": [{k: v for k, v in product.items() if not k.endswith("base64")} for product in result.get("products", [])],
+                    "caveat": result.get("caveat", ""),
+                }
                 st.warning(result["caveat"])
                 for product in result["products"]:
                     st.markdown(f"**{product['time_utc']} · {product['valid_vectors']} valid vectors · {product['good_vectors']} good**")
@@ -304,6 +328,12 @@ def satellite_tab():
             try:
                 with st.spinner("Calculating Band 13 diagnostics…"):
                     result = process_convective_cooling_files(uploaded_pairs(cooling_files))
+                st.session_state["comprehensive_satellite_cooling"] = {
+                    "files": [f.name for f in cooling_files],
+                    "statistics": result.get("statistics", []),
+                    "cold_core_centroids": result.get("cold_core_centroids", []),
+                    "caveat": result.get("caveat", ""),
+                }
                 show_b64_image(result["summary_png_base64"], "Cold-cloud evolution")
                 show_b64_image(result["cooling_png_base64"], "Apparent brightness-temperature change")
                 st.dataframe(pd.DataFrame(result["statistics"]), use_container_width=True)
@@ -354,6 +384,13 @@ def sounding_panel(prefix):
             profile = profile[(profile["p"] > 0) & profile["p"].le(1100) & profile["T"].between(-100, 60)].sort_values("p", ascending=False)
             if len(profile) < 5: raise ValueError(f"Only {len(profile)} valid pressure levels found.")
             profile["height_km"] = profile.z / 1000 if profile.z.notna().any() else 44330 * (1 - (profile.p / 1013.25) ** 0.1903) / 1000
+            st.session_state["comprehensive_sounding"] = {
+                "file": file.name, "valid_levels": len(profile),
+                "pressure_hpa": [float(profile.p.min()), float(profile.p.max())],
+                "height_km": [float(profile.height_km.min()), float(profile.height_km.max())],
+                "wind_levels": int(profile.dropna(subset=["ws", "wd"]).shape[0]),
+                "wind_speed_ms": ([float(profile.ws.min()), float(profile.ws.max())] if profile.ws.notna().any() else None),
+            }
             st.caption(f"{file.name} · {len(profile)} valid levels")
             fig, ax = plt.subplots(figsize=(10, 8))
             fig.subplots_adjust(left=0.10, right=0.76, bottom=0.10, top=0.90)
@@ -527,6 +564,10 @@ def surface_tab():
             else:
                 reports = [line.strip() for line in text.splitlines() if line.strip()]
             parsed = pd.DataFrame([parse_metar(report) for report in reports])
+            st.session_state["comprehensive_metar"] = {
+                "file": metar_file.name, "reports": len(parsed),
+                "parsed_fields": [name for name in ("wind", "visibility", "temperature_dewpoint_C", "qnh_hPa") if name in parsed and parsed[name].astype(str).str.len().gt(0).any()],
+            }
             if parsed.empty:
                 st.info("No report lines found in this file.")
             else:
@@ -545,6 +586,11 @@ def surface_tab():
             if frame.empty:
                 st.info("The LLWAS file has no data rows.")
             else:
+                st.session_state["comprehensive_llwas"] = {
+                    "file": llwas_file.name, "rows": len(frame),
+                    "columns": [str(c) for c in frame.columns],
+                    "numeric_summary": frame.select_dtypes("number").describe().round(2).to_dict(),
+                }
                 show_observation_table(frame)
                 numeric = frame.select_dtypes("number")
                 if not numeric.empty:
@@ -571,20 +617,70 @@ def pilot_tab():
         if frame.empty: st.info("No data rows in file."); return
         date_column = st.selectbox("Report date column", list(frame.columns))
         accident_date = st.date_input("Accident date", value=date.today())
+        st.session_state["comprehensive_pirep_upload"] = {
+            "file": file.name, "rows": len(frame), "date_column": str(date_column),
+            "selected_date": accident_date.isoformat(),
+        }
         if st.button("Show reports for selected date", type="primary"):
             dates = pd.to_datetime(frame[date_column], errors="coerce", dayfirst=False).dt.date
             matches = frame.loc[dates == accident_date]
+            st.session_state["comprehensive_pirep"] = {
+                **st.session_state["comprehensive_pirep_upload"],
+                "matching_rows": len(matches),
+            }
             st.success(f"{len(matches)} matching row(s) in {file.name} for {accident_date.isoformat()}.")
             if matches.empty: st.info("No rows matched the selected date.")
             else: st.dataframe(matches, use_container_width=True, hide_index=True)
     except Exception as exc: st.error(f"Could not read pilot report: {exc}")
 
 
-tabs = st.tabs(["Radar Analyze", "Satellite Analyze", "Surface Analyze", "Upper Air Analyze", "Pilot Report"])
+def comprehensive_tab():
+    st.subheader("Cross-source evidence overview")
+    st.caption("This page summarizes successful analyses from the other tabs in this browser session. It does not automatically fuse measurements into a forecast or operational decision.")
+    state = st.session_state
+    sources = [
+        ("Radar", "comprehensive_radar", "Radar Analyze"),
+        ("Satellite", ("comprehensive_satellite_field", "comprehensive_satellite_motion", "comprehensive_satellite_dense", "comprehensive_satellite_cooling"), "Satellite Analyze"),
+        ("Surface · METAR/SPECI", "comprehensive_metar", "Surface Analyze"),
+        ("Surface · LLWAS", "comprehensive_llwas", "Surface Analyze"),
+        ("Upper air sounding", "comprehensive_sounding", "Upper Air Analyze"),
+        ("Pilot report", ("comprehensive_pirep", "comprehensive_pirep_upload"), "Pilot Report"),
+    ]
+    rows = []
+    for label, keys, menu in sources:
+        keys = (keys,) if isinstance(keys, str) else keys
+        available = [key for key in keys if key in state]
+        rows.append({"Source": label, "Status": "Analyzed / available" if available else "Not yet analyzed", "Details": ", ".join(available) if available else f"Use {menu}"})
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    if not any(row["Status"] == "Analyzed / available" for row in rows):
+        st.info("Analyze or upload data in the source tabs first. Successful processing in this browser session will populate this overview.")
+
+    for title, key in (
+        ("Radar analysis", "comprehensive_radar"),
+        ("Satellite single-field plot", "comprehensive_satellite_field"),
+        ("Satellite two-scene motion", "comprehensive_satellite_motion"),
+        ("Satellite dense motion", "comprehensive_satellite_dense"),
+        ("Satellite cooling diagnostics", "comprehensive_satellite_cooling"),
+        ("METAR/SPECI summary", "comprehensive_metar"),
+        ("LLWAS summary", "comprehensive_llwas"),
+        ("Upper-air sounding summary", "comprehensive_sounding"),
+        ("Pilot report date lookup", "comprehensive_pirep"),
+    ):
+        if key in state:
+            with st.expander(title, expanded=False):
+                st.json(state[key])
+
+    st.warning("Time and location alignment is not inferred across sources. Confirm observation times, station/sensor identities, units, coverage, and quality independently before comparing evidence. Missing inputs must not be interpreted as normal conditions.")
+    st.error("Research and advisory use only. Radar attenuation, satellite motion/cooling, and parsed observations are provisional; this overview is not a validated operational warning, clearance, or flight-deck decision.")
+
+
+tabs = st.tabs(["Radar Analyze", "Satellite Analyze", "Surface Analyze", "Upper Air Analyze", "Pilot Report", "Comprehensive Analysis"])
 with tabs[0]: radar_tab()
 with tabs[1]: satellite_tab()
 with tabs[2]: surface_tab()
 with tabs[3]: upper_air_tab()
 with tabs[4]: pilot_tab()
+with tabs[5]: comprehensive_tab()
 
 st.caption("Derived radar attenuation and satellite motion/cooling displays are provisional research products only—not validated operational decisions.")
