@@ -403,6 +403,44 @@ def show_observation_table(frame):
     st.caption("Parsing is partial. Compare against the original report before using any field.")
 
 
+LLWAS_STATIONS = [
+    ("A2 · Tambak Cemandi", -7.3931670, 112.8114620),
+    ("A3 · LANUDAL Timur / Wisma Perwira", -7.3882496, 112.7950262),
+    ("A4 · LANUDAL Selatan / Pos Gerbang", -7.3855002, 112.7772954),
+    ("A5 · Sedati Agung", -7.3843075, 112.7595432),
+    ("A6 · Semambung", -7.3785123, 112.7418114),
+    ("B2 · Banjar Kemuning", -7.3774845, 112.8150496),
+    ("B3 · OTBAN Taman / Terminal 1 parking", -7.3720400, 112.7979481),
+    ("B4 · OTBAN Timur / Basarnas", -7.3688443, 112.7803874),
+    ("B5 · Tropodo", -7.3652068, 112.7619150),
+    ("B6 · Sawotratap", -7.3651160, 112.7443973),
+]
+
+
+def show_llwas_station_map():
+    fig, ax = plt.subplots(figsize=(10, 7))
+    lats = [station[1] for station in LLWAS_STATIONS]
+    lons = [station[2] for station in LLWAS_STATIONS]
+    ax.scatter(lons, lats, s=75, c="#1769aa", edgecolors="white", linewidths=1.2,
+               marker="^", zorder=3, label="LLWAS station (reference location)")
+    for name, lat, lon in LLWAS_STATIONS:
+        ax.annotate(name, (lon, lat), xytext=(6, 5), textcoords="offset points", fontsize=8)
+    ax.scatter([112.7873], [-7.3797], marker="*", s=180, c="#d62728", edgecolors="white",
+               linewidths=0.8, zorder=4, label="Juanda Airport (reference)")
+    ax.set_xlim(min(lons) - 0.012, max(lons) + 0.020)
+    ax.set_ylim(min(lats) - 0.012, max(lats) + 0.012)
+    ax.set_xlabel("Longitude (°E)")
+    ax.set_ylabel("Latitude (°; south is negative)")
+    ax.set_title("Juanda LLWAS station locations")
+    ax.grid(True, alpha=0.3)
+    ax.set_aspect(1 / np.cos(np.deg2rad(np.mean(lats))))
+    ax.legend(loc="best")
+    fig.tight_layout()
+    st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
+    st.caption("Static station locations digitized from the user-provided Google My Maps layer; markers show sensor locations, not live wind observations. [Open source map](https://www.google.com/maps/d/viewer?mid=1qYkHx_INlEsNiOI2Pn4jjgvwfLZA7aZG&hl=en&usp=sharing).")
+
+
 def surface_tab():
     st.subheader("Surface Analyze")
     st.caption("Surface observations only: METAR/SPECI reports and LLWAS data. Radiosonde, wind profiler and LIDAR sources are in Upper Air Analyze. METAR parsing is partial; LLWAS is displayed as supplied.")
@@ -429,6 +467,7 @@ def surface_tab():
 
     st.markdown("##### LLWAS observations")
     st.caption("Low-level windshear alerting system data. Threshold/mid/far and tower winds should be fused with radar and pilot reports before any interpretation.")
+    show_llwas_station_map()
     llwas_file = st.file_uploader("LLWAS CSV", type=CSV_TYPES, key="surface_llwas")
     if llwas_file:
         try:
