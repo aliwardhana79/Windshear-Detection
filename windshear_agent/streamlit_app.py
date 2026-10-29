@@ -8,7 +8,6 @@ import os
 import csv
 import tempfile
 import zipfile
-from xml.sax.saxutils import escape
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -94,64 +93,98 @@ def zip_cropped_scenes(result):
     return archive.getvalue()
 
 
-def make_analysis_docx(text):
-    """Build a small Word-compatible DOCX using only the Python standard library."""
+def make_analysis_docx(html):
+    """Convert rich-editor HTML into a formatted Word document."""
     import re
-    document = [
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
-        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">',
-        '<w:body>',
-        '<w:p><w:pPr><w:pStyle w:val="Title"/></w:pPr><w:r><w:t>Comprehensive Aviation Weather Analysis</w:t></w:r></w:p>',
-    ]
-    for line in text.splitlines() or [""]:
-        leading = len(line) - len(line.lstrip(" "))
-        content = line.lstrip(" ")
-        paragraph_properties = []
-        if leading:
-            paragraph_properties.append(f'<w:ind w:left="{min(leading * 180, 3600)}"/>')
-        match = re.match(r"^(\d+)[.)]\s+(.*)$", content)
-        if match:
-            rendered = f"{match.group(1)}. {match.group(2)}"
-            paragraph_properties.append('<w:pStyle w:val="ListParagraph"/>')
-        elif content.startswith(("- ", "* ")):
-            rendered = "•  " + content[2:]
-            paragraph_properties.append('<w:pStyle w:val="ListParagraph"/>')
-        elif content.startswith("### "):
-            rendered = content[4:]
-            paragraph_properties.append('<w:pStyle w:val="Heading2"/>')
-        elif content.startswith("## "):
-            rendered = content[3:]
-            paragraph_properties.append('<w:pStyle w:val="Heading1"/>')
-        elif content.startswith("# "):
-            rendered = content[2:]
-            paragraph_properties.append('<w:pStyle w:val="Heading1"/>')
-        elif content.startswith("> "):
-            rendered = content[2:]
-            paragraph_properties.append('<w:ind w:left="720"/>')
-        else:
-            rendered = content
-        ppr = '<w:pPr>' + ''.join(paragraph_properties) + '</w:pPr>' if paragraph_properties else ''
-        document.append('<w:p>' + ppr + '<w:r><w:t xml:space="preserve">' + escape(rendered) + '</w:t></w:r></w:p>')
-    document.extend([
-        '<w:p><w:r><w:rPr><w:i/></w:rPr><w:t>Advisory/research only. Not an operational warning or flight-deck decision.</w:t></w:r></w:p>',
-        '<w:sectPr><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"/></w:sectPr>',
-        '</w:body></w:document>',
-    ])
-    archive = io.BytesIO()
-    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as docx:
-        docx.writestr("[Content_Types].xml", '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
-<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
-<Default Extension="xml" ContentType="application/xml"/>
-<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
-</Types>''')
-        docx.writestr("_rels/.rels", '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
-</Relationships>''')
-        docx.writestr("word/document.xml", "".join(document))
-    archive.seek(0)
-    return archive.getvalue()
+    from html.parser import HTMLParser
+    from docx import Document
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.shared import Inches, Pt, RGBColor
+
+    class RichTextParser(HTMLParser):
+        def __init__(self, document):
+            super().__init__(convert_charrefs=True)
+            self.document, self.paragraph = document, None
+            self.styles, self.lists, self.skip = [], [], 0
+
+        def new_paragraph(self, tag="p", attrs=None):
+            attrs = dict(attrs or [])
+            style = {"h1": "Heading 1", "h2": "Heading 2", "h3": "Heading 3"}.get(tag)
+            if self.lists:
+                style = "List Number" if self.lists[-1] == "ol" else "List Bullet"
+            self.paragraph = self.document.add_paragraph(style=style)
+            css = attrs.get("style", "").replace(" ", "").lower()
+            if "text-align:center" in css:
+                self.paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            elif "text-align:right" in css:
+                self.paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+            elif "text-align:justify" in css:
+                self.paragraph.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+
+        def handle_starttag(self, tag, attrs):
+            if tag in ("script", "style"):
+                self.skip += 1
+            elif tag in ("p", "div", "h1", "h2", "h3", "li"):
+                self.new_paragraph(tag, attrs)
+            elif tag in ("ol", "ul"):
+                self.lists.append(tag)
+            elif tag in ("strong", "b", "em", "i", "u", "s", "strike", "sub", "sup", "span", "a"):
+                self.styles.append((tag, dict(attrs).get("style", "")))
+            elif tag == "br":
+                self.ensure_paragraph().add_run().add_break()
+
+        def handle_endtag(self, tag):
+            if tag in ("script", "style"):
+                self.skip = max(0, self.skip - 1)
+            elif tag in ("ol", "ul"):
+                if self.lists:
+                    self.lists.pop()
+            elif tag in ("strong", "b", "em", "i", "u", "s", "strike", "sub", "sup", "span", "a"):
+                if self.styles:
+                    self.styles.pop()
+            elif tag in ("p", "div", "h1", "h2", "h3", "li"):
+                self.paragraph = None
+
+        def ensure_paragraph(self):
+            if self.paragraph is None:
+                self.new_paragraph()
+            return self.paragraph
+
+        def handle_data(self, data):
+            if self.skip or not data:
+                return
+            run = self.ensure_paragraph().add_run(data)
+            tags = [tag for tag, _ in self.styles]
+            run.bold = any(tag in tags for tag in ("b", "strong"))
+            run.italic = any(tag in tags for tag in ("i", "em"))
+            run.underline = "u" in tags
+            run.font.strike = any(tag in tags for tag in ("s", "strike"))
+            run.font.subscript = "sub" in tags
+            run.font.superscript = "sup" in tags
+            css = " ".join(style for _, style in self.styles)
+            color = re.search(r"color:\s*#?([0-9a-fA-F]{6})", css)
+            if color:
+                run.font.color.rgb = RGBColor.from_string(color.group(1))
+            size = re.search(r"font-size:\s*(\d+(?:\.\d+)?)px", css)
+            if size:
+                run.font.size = Pt(float(size.group(1)) * 0.75)
+
+    document = Document()
+    section = document.sections[0]
+    section.top_margin = Inches(0.7)
+    section.bottom_margin = Inches(0.7)
+    title = document.add_heading("Comprehensive Aviation Weather Analysis", 0)
+    title.paragraph_format.space_after = Pt(12)
+    RichTextParser(document).feed(html or "")
+    warning = document.add_paragraph()
+    warning.paragraph_format.space_before = Pt(12)
+    run = warning.add_run("Advisory/research only. Not an operational warning or flight-deck decision.")
+    run.italic = True
+    run.font.color.rgb = RGBColor(128, 64, 0)
+    output = io.BytesIO()
+    document.save(output)
+    output.seek(0)
+    return output.getvalue()
 
 
 def show_b64_image(value, caption=None):
@@ -798,32 +831,37 @@ def comprehensive_tab():
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
     st.markdown("#### Your written analysis")
-    st.caption("Use the formatting controls to insert Markdown headings, numbered/bulleted items, and indented paragraphs. Preview and Word download use that formatting.")
-
-    def append_analysis_snippet(snippet):
-        current = st.session_state.get("comprehensive_analysis_text", "")
-        if current and not current.endswith("\n"):
-            current += "\n"
-        st.session_state["comprehensive_analysis_text"] = current + snippet
-
-    t1, t2, t3, t4, t5 = st.columns(5)
-    t1.button("Heading", key="analysis_insert_heading", on_click=append_analysis_snippet, args=("## Heading\n",))
-    t2.button("Numbered item", key="analysis_insert_number", on_click=append_analysis_snippet, args=("1. Numbered item\n",))
-    t3.button("Next number", key="analysis_insert_next_number", on_click=append_analysis_snippet, args=("2. Numbered item\n",))
-    t4.button("Bullet item", key="analysis_insert_bullet", on_click=append_analysis_snippet, args=("- Bullet item\n",))
-    t5.button("Indent paragraph", key="analysis_insert_indent", on_click=append_analysis_snippet, args=("    Indented paragraph\n",))
-    analysis_text = st.text_area(
-        "Comprehensive analysis notes",
-        key="comprehensive_analysis_text",
-        height=300,
-        placeholder="Enter the event context, observations, source-by-source interpretation, time/location alignment, uncertainty, and follow-up checks…",
-    )
-    if analysis_text.strip():
+    st.caption("Use the toolbar to format text like a Word document: paragraph styles, bold/italic/underline, font size/color, alignment, lists, indentation and links.")
+    from streamlit_quill import st_quill
+    analysis_html = st_quill(
+        value=state.get("comprehensive_analysis_html", ""),
+        placeholder="Enter event context, observations, source-by-source interpretation, alignment, uncertainty, and follow-up checks…",
+        html=True,
+        toolbar=[
+            [{"header": [1, 2, 3, False]}, {"size": ["small", False, "large", "huge"]}],
+            ["bold", "italic", "underline", "strike"],
+            [{"color": []}, {"background": []}],
+            [{"list": "ordered"}, {"list": "bullet"}, {"indent": "-1"}, {"indent": "+1"}],
+            [{"align": []}],
+            ["blockquote", "link", "clean"],
+        ],
+        key="comprehensive_analysis_editor",
+    ) or ""
+    state["comprehensive_analysis_html"] = analysis_html
+    if analysis_html.strip():
+        import bleach
+        preview_html = bleach.clean(
+            analysis_html,
+            tags={"p", "br", "strong", "b", "em", "i", "u", "s", "ol", "ul", "li", "h1", "h2", "h3", "span", "blockquote", "a"},
+            attributes={"span": ["style"], "a": ["href", "title"], "p": ["style"], "h1": ["style"], "h2": ["style"], "h3": ["style"]},
+            protocols={"http", "https", "mailto"},
+            strip=True,
+        )
         with st.expander("Formatted preview", expanded=True):
-            st.markdown(analysis_text)
+            st.markdown(preview_html, unsafe_allow_html=True)
         st.download_button(
             "Save analysis as Word document (.docx)",
-            data=make_analysis_docx(analysis_text),
+            data=make_analysis_docx(analysis_html),
             file_name=f"comprehensive_analysis_{date.today().isoformat()}.docx",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             key="download_comprehensive_docx",
