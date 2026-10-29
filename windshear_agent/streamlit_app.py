@@ -660,6 +660,57 @@ def comprehensive_tab():
         "Upper air sounding": [sounding_upload.name] if sounding_upload else [],
         "Pilot report": [pirep_upload.name] if pirep_upload else [],
     }
+    with st.expander("Preview attached images and tables", expanded=False):
+        image_groups = [
+            ("Radar image", radar_upload or []),
+            ("Satellite image", satellite_upload or []),
+            ("Upper-air image", [sounding_upload] if sounding_upload else []),
+        ]
+        for label, uploads in image_groups:
+            for uploaded in uploads:
+                st.markdown(f"**{label}: {uploaded.name}**")
+                if Path(uploaded.name).suffix.lower() == ".svg":
+                    st.info("SVG attached. For safety, active SVG content is not rendered in-page; open the downloaded file in a trusted viewer.")
+                    st.download_button("Download SVG", uploaded.getvalue(), file_name=Path(uploaded.name).name,
+                                       mime="image/svg+xml", key=f"preview_svg_{label}_{uploaded.name}")
+                else:
+                    try:
+                        from PIL import Image
+                        image = Image.open(io.BytesIO(uploaded.getvalue()))
+                        image.thumbnail((1600, 1200))
+                        if image.mode not in ("RGB", "RGBA"):
+                            image = image.convert("RGBA" if "transparency" in image.info else "RGB")
+                        st.image(image, caption=uploaded.name, use_container_width=True)
+                    except Exception as exc:
+                        st.warning(f"Could not preview this image: {exc}")
+
+        table_uploads = [
+            ("METAR/SPECI", metar_upload),
+            ("LLWAS", llwas_upload),
+            ("Pilot report", pirep_upload),
+        ]
+        for label, uploaded in table_uploads:
+            if uploaded is None:
+                continue
+            st.markdown(f"**{label}: {uploaded.name}**")
+            suffix = Path(uploaded.name).suffix.lower()
+            try:
+                if suffix == ".csv":
+                    preview = pd.read_csv(io.BytesIO(uploaded.getvalue()), encoding="utf-8-sig", nrows=100)
+                    st.dataframe(preview, use_container_width=True, hide_index=True)
+                    st.caption("Showing up to the first 100 rows.")
+                elif suffix in (".xls", ".xlsx"):
+                    engine = "xlrd" if suffix == ".xls" else "openpyxl"
+                    preview = pd.read_excel(io.BytesIO(uploaded.getvalue()), engine=engine, nrows=100)
+                    st.dataframe(preview, use_container_width=True, hide_index=True)
+                    st.caption("Showing up to the first 100 rows.")
+                else:
+                    text = uploaded.getvalue().decode("utf-8-sig", errors="replace")
+                    st.code("\n".join(text.splitlines()[:100]), language="text")
+                    st.caption("Showing up to the first 100 lines.")
+            except Exception as exc:
+                st.warning(f"Could not preview this file: {exc}")
+
     sources = [
         ("Radar", "comprehensive_radar", "Radar Analyze"),
         ("Satellite", ("comprehensive_satellite_field", "comprehensive_satellite_motion", "comprehensive_satellite_dense", "comprehensive_satellite_cooling"), "Satellite Analyze"),
