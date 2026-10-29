@@ -17,6 +17,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 st.set_page_config(page_title="Windshear Agent · Juanda", page_icon="🌦️", layout="wide")
 
@@ -34,6 +35,7 @@ NC_TYPES = accept("nc", "nc4", "cdf")
 CSV_TYPES = accept("csv")
 OBS_TYPES = accept("csv", "txt", "metar", "speci")
 SHEET_TYPES = accept("xls", "xlsx", "csv")
+IMAGE_TYPES = accept("png", "jpg", "jpeg", "bmp", "webp", "tif", "tiff", "svg")
 
 
 def header_image_path():
@@ -89,6 +91,100 @@ def zip_cropped_scenes(result):
         return None
     archive.seek(0)
     return archive.getvalue()
+
+
+def make_analysis_docx(html):
+    """Convert rich-editor HTML into a formatted Word document."""
+    import re
+    from html.parser import HTMLParser
+    from docx import Document
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.shared import Inches, Pt, RGBColor
+
+    class RichTextParser(HTMLParser):
+        def __init__(self, document):
+            super().__init__(convert_charrefs=True)
+            self.document, self.paragraph = document, None
+            self.styles, self.lists, self.skip = [], [], 0
+
+        def new_paragraph(self, tag="p", attrs=None):
+            attrs = dict(attrs or [])
+            style = {"h1": "Heading 1", "h2": "Heading 2", "h3": "Heading 3"}.get(tag)
+            if self.lists:
+                style = "List Number" if self.lists[-1] == "ol" else "List Bullet"
+            self.paragraph = self.document.add_paragraph(style=style)
+            css = attrs.get("style", "").replace(" ", "").lower()
+            if "text-align:center" in css:
+                self.paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            elif "text-align:right" in css:
+                self.paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+            elif "text-align:justify" in css:
+                self.paragraph.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+
+        def handle_starttag(self, tag, attrs):
+            if tag in ("script", "style"):
+                self.skip += 1
+            elif tag in ("p", "div", "h1", "h2", "h3", "li"):
+                self.new_paragraph(tag, attrs)
+            elif tag in ("ol", "ul"):
+                self.lists.append(tag)
+            elif tag in ("strong", "b", "em", "i", "u", "s", "strike", "sub", "sup", "span", "a"):
+                self.styles.append((tag, dict(attrs).get("style", "")))
+            elif tag == "br":
+                self.ensure_paragraph().add_run().add_break()
+
+        def handle_endtag(self, tag):
+            if tag in ("script", "style"):
+                self.skip = max(0, self.skip - 1)
+            elif tag in ("ol", "ul"):
+                if self.lists:
+                    self.lists.pop()
+            elif tag in ("strong", "b", "em", "i", "u", "s", "strike", "sub", "sup", "span", "a"):
+                if self.styles:
+                    self.styles.pop()
+            elif tag in ("p", "div", "h1", "h2", "h3", "li"):
+                self.paragraph = None
+
+        def ensure_paragraph(self):
+            if self.paragraph is None:
+                self.new_paragraph()
+            return self.paragraph
+
+        def handle_data(self, data):
+            if self.skip or not data:
+                return
+            run = self.ensure_paragraph().add_run(data)
+            tags = [tag for tag, _ in self.styles]
+            run.bold = any(tag in tags for tag in ("b", "strong"))
+            run.italic = any(tag in tags for tag in ("i", "em"))
+            run.underline = "u" in tags
+            run.font.strike = any(tag in tags for tag in ("s", "strike"))
+            run.font.subscript = "sub" in tags
+            run.font.superscript = "sup" in tags
+            css = " ".join(style for _, style in self.styles)
+            color = re.search(r"color:\s*#?([0-9a-fA-F]{6})", css)
+            if color:
+                run.font.color.rgb = RGBColor.from_string(color.group(1))
+            size = re.search(r"font-size:\s*(\d+(?:\.\d+)?)px", css)
+            if size:
+                run.font.size = Pt(float(size.group(1)) * 0.75)
+
+    document = Document()
+    section = document.sections[0]
+    section.top_margin = Inches(0.7)
+    section.bottom_margin = Inches(0.7)
+    title = document.add_heading("Comprehensive Aviation Weather Analysis", 0)
+    title.paragraph_format.space_after = Pt(12)
+    RichTextParser(document).feed(html or "")
+    warning = document.add_paragraph()
+    warning.paragraph_format.space_before = Pt(12)
+    run = warning.add_run("Advisory/research only. Not an operational warning or flight-deck decision.")
+    run.italic = True
+    run.font.color.rgb = RGBColor(128, 64, 0)
+    output = io.BytesIO()
+    document.save(output)
+    output.seek(0)
+    return output.getvalue()
 
 
 def show_b64_image(value, caption=None):
@@ -174,6 +270,14 @@ def radar_tab():
             try:
                 with st.spinner("Decoding, aligning and QC-filtering moments…"):
                     result = process_uploaded_volumes(volumes, display_moment=moment, thresholds=thresholds, attenuation_method=attenuation)
+                st.session_state["comprehensive_radar"] = {
+                    "files": [name for name, _ in volumes],
+                    "moments": result.get("available_moments", []),
+                    "display_moment": result.get("display_moment"),
+                    "attenuation_method": result.get("attenuation_method"),
+                    "sweeps": [{"elevation_deg": s.get("elevation_deg"), "range_max_km": s.get("range_max_km"), "statistics": s.get("statistics", {})} for s in result.get("sweeps", [])],
+                    "caveat": result.get("caveat", ""),
+                }
                 st.info(f"Moments: {', '.join(result['available_moments'])} · Display: {result['display_moment']} · attenuation: {result['attenuation_method']}")
                 st.warning(result["caveat"])
                 for sweep in result["sweeps"]:
@@ -252,6 +356,12 @@ def satellite_tab():
             try:
                 with st.spinner("Reading and plotting Juanda-area field…"):
                     out = process_satellite_file(single.name, single.getvalue(), variable)
+                st.session_state["comprehensive_satellite_field"] = {
+                    "file": out.get("filename"), "variable": out.get("variable"),
+                    "long_name": out.get("long_name"), "units": out.get("units"),
+                    "grid_shape": out.get("grid_shape"), "region": out.get("region"),
+                    "statistics": out.get("statistics"), "caveat": out.get("caveat", ""),
+                }
                 st.caption(f"{out['filename']} · {out['variable']} · {out['long_name']} · {out['units']} · grid {out['grid_shape']}")
                 show_b64_image(out["preview"]["png_base64"])
                 st.json(out["statistics"])
@@ -271,6 +381,11 @@ def satellite_tab():
             try:
                 with st.spinner("Tracking image features…"):
                     result = process_motion_files(uploaded_pairs([earlier, later]))
+                st.session_state["comprehensive_satellite_motion"] = {
+                    "files": [earlier.name, later.name],
+                    "bands": [{k: v for k, v in band.items() if k not in ("preview",)} for band in result.get("bands", [])],
+                    "caveat": result.get("caveat", ""),
+                }
                 st.warning(result["caveat"])
                 for band in result["bands"]:
                     st.markdown(f"**Band {band['band']} · {band['variable']} · {band['time_delta_minutes']} minute interval**")
@@ -288,6 +403,11 @@ def satellite_tab():
             try:
                 with st.spinner("Calculating dense cloud motion…"):
                     result = process_uploaded_sequence(uploaded_pairs(dense))
+                st.session_state["comprehensive_satellite_dense"] = {
+                    "files": [f.name for f in dense], "scenes": result.get("scenes"),
+                    "products": [{k: v for k, v in product.items() if not k.endswith("base64")} for product in result.get("products", [])],
+                    "caveat": result.get("caveat", ""),
+                }
                 st.warning(result["caveat"])
                 for product in result["products"]:
                     st.markdown(f"**{product['time_utc']} · {product['valid_vectors']} valid vectors · {product['good_vectors']} good**")
@@ -303,6 +423,12 @@ def satellite_tab():
             try:
                 with st.spinner("Calculating Band 13 diagnostics…"):
                     result = process_convective_cooling_files(uploaded_pairs(cooling_files))
+                st.session_state["comprehensive_satellite_cooling"] = {
+                    "files": [f.name for f in cooling_files],
+                    "statistics": result.get("statistics", []),
+                    "cold_core_centroids": result.get("cold_core_centroids", []),
+                    "caveat": result.get("caveat", ""),
+                }
                 show_b64_image(result["summary_png_base64"], "Cold-cloud evolution")
                 show_b64_image(result["cooling_png_base64"], "Apparent brightness-temperature change")
                 st.dataframe(pd.DataFrame(result["statistics"]), use_container_width=True)
@@ -353,8 +479,16 @@ def sounding_panel(prefix):
             profile = profile[(profile["p"] > 0) & profile["p"].le(1100) & profile["T"].between(-100, 60)].sort_values("p", ascending=False)
             if len(profile) < 5: raise ValueError(f"Only {len(profile)} valid pressure levels found.")
             profile["height_km"] = profile.z / 1000 if profile.z.notna().any() else 44330 * (1 - (profile.p / 1013.25) ** 0.1903) / 1000
+            st.session_state["comprehensive_sounding"] = {
+                "file": file.name, "valid_levels": len(profile),
+                "pressure_hpa": [float(profile.p.min()), float(profile.p.max())],
+                "height_km": [float(profile.height_km.min()), float(profile.height_km.max())],
+                "wind_levels": int(profile.dropna(subset=["ws", "wd"]).shape[0]),
+                "wind_speed_ms": ([float(profile.ws.min()), float(profile.ws.max())] if profile.ws.notna().any() else None),
+            }
             st.caption(f"{file.name} · {len(profile)} valid levels")
-            fig, ax = plt.subplots(figsize=(8, 8))
+            fig, ax = plt.subplots(figsize=(10, 8))
+            fig.subplots_adjust(left=0.10, right=0.76, bottom=0.10, top=0.90)
             ax.set_yscale("log"); ax.set_ylim(min(1050, profile.p.max()), max(10, profile.p.min()))
             ax.set_ylabel("Pressure (hPa)"); ax.set_xlabel("Temperature (°C; skewed x-coordinate)"); ax.grid(True, which="both", alpha=.3)
             for temp_col, color, label in (("T", "tab:red", "Temperature"), ("Td", "tab:green", "Dewpoint")):
@@ -364,6 +498,31 @@ def sounding_panel(prefix):
             ax2 = ax.twinx(); ticks = [1000, 900, 800, 700, 600, 500, 400, 300, 200, 100]
             ticks = [p for p in ticks if profile.p.min() <= p <= profile.p.max()]
             ax2.set_yscale("log"); ax2.set_ylim(ax.get_ylim()); ax2.set_yticks(ticks); ax2.set_yticklabels([f"{np.interp(p, profile.p[::-1], profile.height_km[::-1]):.1f}" for p in ticks]); ax2.set_ylabel("Height (km; approximate if not measured)")
+            wind = profile.dropna(subset=["ws", "wd", "p"]).copy()
+            wind = wind[(wind.ws >= 0) & (wind.wd >= 0) & (wind.wd <= 360)]
+            if not wind.empty:
+                # Thin very high-resolution soundings to a readable set of levels.
+                if len(wind) > 35:
+                    keep = np.linspace(0, len(wind) - 1, 35).round().astype(int)
+                    wind = wind.iloc[np.unique(keep)]
+                direction = np.deg2rad(wind.wd.to_numpy(dtype=float))
+                speed = wind.ws.to_numpy(dtype=float)
+                # Meteorological direction is the direction the wind comes from.
+                u = -speed * np.sin(direction)
+                v = -speed * np.cos(direction)
+                wind_ax = fig.add_axes([0.81, 0.10, 0.17, 0.80])
+                wind_ax.set_yscale("log")
+                wind_ax.set_ylim(ax.get_ylim())
+                wind_ax.set_xlim(0, 1.7)
+                wind_ax.set_xticks([])
+                wind_ax.tick_params(axis="y", left=False, labelleft=False, right=False, labelright=False)
+                for spine in wind_ax.spines.values(): spine.set_visible(False)
+                wind_ax.barbs(np.full(len(wind), 0.48), wind.p.to_numpy(dtype=float), u, v,
+                              length=5.5, linewidth=0.7, pivot="middle", barb_increments={"half": 2, "full": 4, "flag": 20})
+                for pressure, value in zip(wind.p.to_numpy(dtype=float), speed):
+                    wind_ax.annotate(f"{value:g}", (0.98, pressure), xycoords="data",
+                                     xytext=(2, 0), textcoords="offset points", va="center", fontsize=7)
+                wind_ax.set_title("Wind\nbarbs · m/s", fontsize=9, pad=5)
             st.pyplot(fig, use_container_width=True); plt.close(fig)
             charts = st.columns(3)
             for axis, value, title, color, limits in zip(charts, ["ws", "wd", "RH"], ["Wind speed (m/s)", "Wind direction (°)", "Relative humidity (%)"], ["tab:blue", "purple", "teal"], [(0, None), (0, 360), (0, 100)]):
@@ -417,28 +576,71 @@ LLWAS_STATIONS = [
 ]
 
 
+def load_kkop_lines():
+    """Load packaged KKOP boundaries as Leaflet [lat, lon] polyline arrays."""
+    path = Path(__file__).parent / "assets" / "kkop.geojson"
+    if not path.is_file():
+        return []
+    try:
+        collection = json.loads(path.read_text(encoding="utf-8"))
+        lines = []
+        for feature in collection.get("features", []):
+            geometry = feature.get("geometry") or {}
+            kind, coordinates = geometry.get("type"), geometry.get("coordinates", [])
+            if kind == "LineString":
+                candidates = [coordinates]
+            elif kind == "MultiLineString":
+                candidates = coordinates
+            else:
+                continue
+            for line in candidates:
+                points = [[float(point[1]), float(point[0])] for point in line if len(point) >= 2]
+                if len(points) >= 2:
+                    lines.append(points)
+        return lines
+    except (OSError, ValueError, TypeError, IndexError):
+        return []
+
+
 def show_llwas_station_map():
-    fig, ax = plt.subplots(figsize=(10, 7))
-    lats = [station[1] for station in LLWAS_STATIONS]
-    lons = [station[2] for station in LLWAS_STATIONS]
-    ax.scatter(lons, lats, s=75, c="#1769aa", edgecolors="white", linewidths=1.2,
-               marker="^", zorder=3, label="LLWAS station (reference location)")
-    for name, lat, lon in LLWAS_STATIONS:
-        ax.annotate(name, (lon, lat), xytext=(6, 5), textcoords="offset points", fontsize=8)
-    ax.scatter([112.7873], [-7.3797], marker="*", s=180, c="#d62728", edgecolors="white",
-               linewidths=0.8, zorder=4, label="Juanda Airport (reference)")
-    ax.set_xlim(min(lons) - 0.012, max(lons) + 0.020)
-    ax.set_ylim(min(lats) - 0.012, max(lats) + 0.012)
-    ax.set_xlabel("Longitude (°E)")
-    ax.set_ylabel("Latitude (°; south is negative)")
-    ax.set_title("Juanda LLWAS station locations")
-    ax.grid(True, alpha=0.3)
-    ax.set_aspect(1 / np.cos(np.deg2rad(np.mean(lats))))
-    ax.legend(loc="best")
-    fig.tight_layout()
-    st.pyplot(fig, use_container_width=True)
-    plt.close(fig)
-    st.caption("Static station locations digitized from the user-provided Google My Maps layer; markers show sensor locations, not live wind observations. [Open source map](https://www.google.com/maps/d/viewer?mid=1qYkHx_INlEsNiOI2Pn4jjgvwfLZA7aZG&hl=en&usp=sharing).")
+    import json
+
+    stations_json = json.dumps([
+        {"name": name, "lat": lat, "lon": lon} for name, lat, lon in LLWAS_STATIONS
+    ])
+    kkop_json = json.dumps(load_kkop_lines())
+    map_html = f"""<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>html,body,#map{{height:100%;width:100%;margin:0}} .legend{{background:white;padding:7px 10px;border-radius:4px;font:13px Arial;line-height:1.7;box-shadow:0 1px 5px #777}} .station-dot{{color:#1769aa;font-size:24px;font-weight:bold;line-height:20px;text-shadow:0 0 3px white}} .airport-star{{color:#d62728;font-size:23px;text-shadow:0 0 3px white}}</style>
+</head><body><div id="map"></div>
+<script>
+const stations = {stations_json};
+const kkopLines = {kkop_json};
+const map = L.map('map').setView([-7.3797, 112.7873], 12);
+L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+  maxZoom: 19,
+  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+}}).addTo(map);
+kkopLines.forEach(line => L.polyline(line, {{color:'#e32636', weight:3, opacity:0.95, dashArray:'8 5'}})
+  .addTo(map).bindPopup('<b>KKOP Juanda</b><br>Reference boundary'));
+stations.forEach(s => L.marker([s.lat, s.lon], {{
+  icon: L.divIcon({{className:'station-dot', html:'▲', iconSize:[22,22], iconAnchor:[11,11]}})
+}}).addTo(map).bindPopup('<b>'+s.name+'</b><br>LLWAS reference location'));
+L.marker([-7.3797, 112.7873], {{
+  icon: L.divIcon({{className:'airport-star', html:'★', iconSize:[24,24], iconAnchor:[12,12]}})
+}}).addTo(map).bindPopup('<b>Juanda Airport</b> (reference)');
+L.control.scale({{metric:true, imperial:false}}).addTo(map);
+L.control({{position:'topright'}}).onAdd = function() {{
+  const div = L.DomUtil.create('div','legend');
+  div.innerHTML = '<span style="color:#1769aa">▲</span> LLWAS station<br><span style="color:#d62728">★</span> Juanda Airport<br><span style="color:#e32636">━ ━</span> KKOP boundary';
+  return div;
+}}.addTo(map);
+</script></body></html>"""
+    components.html(map_html, height=540, scrolling=False)
+    st.caption("Map tiles require an internet connection and are provided by OpenStreetMap. LLWAS markers are static locations digitized from the [user-provided Google My Maps layer](https://www.google.com/maps/d/viewer?mid=1qYkHx_INlEsNiOI2Pn4jjgvwfLZA7aZG&hl=en&usp=sharing); the red dashed line is the KKOP reference boundary from the supplied GeoJSON. Neither layer displays live winds.")
 
 
 def surface_tab():
@@ -457,6 +659,10 @@ def surface_tab():
             else:
                 reports = [line.strip() for line in text.splitlines() if line.strip()]
             parsed = pd.DataFrame([parse_metar(report) for report in reports])
+            st.session_state["comprehensive_metar"] = {
+                "file": metar_file.name, "reports": len(parsed),
+                "parsed_fields": [name for name in ("wind", "visibility", "temperature_dewpoint_C", "qnh_hPa") if name in parsed and parsed[name].astype(str).str.len().gt(0).any()],
+            }
             if parsed.empty:
                 st.info("No report lines found in this file.")
             else:
@@ -475,6 +681,11 @@ def surface_tab():
             if frame.empty:
                 st.info("The LLWAS file has no data rows.")
             else:
+                st.session_state["comprehensive_llwas"] = {
+                    "file": llwas_file.name, "rows": len(frame),
+                    "columns": [str(c) for c in frame.columns],
+                    "numeric_summary": frame.select_dtypes("number").describe().round(2).to_dict(),
+                }
                 show_observation_table(frame)
                 numeric = frame.select_dtypes("number")
                 if not numeric.empty:
@@ -501,20 +712,189 @@ def pilot_tab():
         if frame.empty: st.info("No data rows in file."); return
         date_column = st.selectbox("Report date column", list(frame.columns))
         accident_date = st.date_input("Accident date", value=date.today())
+        st.session_state["comprehensive_pirep_upload"] = {
+            "file": file.name, "rows": len(frame), "date_column": str(date_column),
+            "selected_date": accident_date.isoformat(),
+        }
         if st.button("Show reports for selected date", type="primary"):
             dates = pd.to_datetime(frame[date_column], errors="coerce", dayfirst=False).dt.date
             matches = frame.loc[dates == accident_date]
+            st.session_state["comprehensive_pirep"] = {
+                **st.session_state["comprehensive_pirep_upload"],
+                "matching_rows": len(matches),
+            }
             st.success(f"{len(matches)} matching row(s) in {file.name} for {accident_date.isoformat()}.")
             if matches.empty: st.info("No rows matched the selected date.")
             else: st.dataframe(matches, use_container_width=True, hide_index=True)
     except Exception as exc: st.error(f"Could not read pilot report: {exc}")
 
 
-tabs = st.tabs(["Radar Analyze", "Satellite Analyze", "Surface Analyze", "Upper Air Analyze", "Pilot Report"])
+def comprehensive_tab():
+    st.subheader("Cross-source evidence overview")
+    st.caption("Attach files here for the cross-source inventory, or analyze them in their dedicated tabs. Attachments here are not automatically processed or fused into a forecast or operational decision.")
+    state = st.session_state
+    with st.expander("Attach source files", expanded=True):
+        st.caption("Image attachments appear in the Status table as attached, but are not decoded as source measurements. Use the dedicated source tabs to analyze raw radar, satellite, or sounding data.")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            radar_upload = st.file_uploader("Radar plot/image (.jpg, .jpeg, .png, .bmp, .svg, .webp, .tif)", type=IMAGE_TYPES, accept_multiple_files=True, key="comprehensive_radar_files")
+            metar_upload = st.file_uploader("METAR/SPECI (.csv, .txt)", type=OBS_TYPES, key="comprehensive_metar_file")
+        with c2:
+            satellite_upload = st.file_uploader("Satellite image (.jpg, .jpeg, .png, .bmp, .svg, .webp, .tif)", type=IMAGE_TYPES, accept_multiple_files=True, key="comprehensive_satellite_files")
+            llwas_upload = st.file_uploader("LLWAS observations (.csv)", type=CSV_TYPES, key="comprehensive_llwas_file")
+        with c3:
+            sounding_upload = st.file_uploader("Upper-air plot/image (.jpg, .jpeg, .png, .bmp, .svg, .webp, .tif)", type=IMAGE_TYPES, key="comprehensive_sounding_file")
+            pirep_upload = st.file_uploader("Pilot reports (.xls, .xlsx, .csv)", type=SHEET_TYPES, key="comprehensive_pirep_file")
+
+    attached = {
+        "Radar": [f.name for f in (radar_upload or [])],
+        "Satellite": [f.name for f in (satellite_upload or [])],
+        "Surface · METAR/SPECI": [metar_upload.name] if metar_upload else [],
+        "Surface · LLWAS": [llwas_upload.name] if llwas_upload else [],
+        "Upper air sounding": [sounding_upload.name] if sounding_upload else [],
+        "Pilot report": [pirep_upload.name] if pirep_upload else [],
+    }
+    with st.expander("Preview attached images and tables", expanded=False):
+        image_groups = [
+            ("Radar image", radar_upload or []),
+            ("Satellite image", satellite_upload or []),
+            ("Upper-air image", [sounding_upload] if sounding_upload else []),
+        ]
+        for label, uploads in image_groups:
+            for uploaded in uploads:
+                st.markdown(f"**{label}: {uploaded.name}**")
+                if Path(uploaded.name).suffix.lower() == ".svg":
+                    st.info("SVG attached. For safety, active SVG content is not rendered in-page; open the downloaded file in a trusted viewer.")
+                    st.download_button("Download SVG", uploaded.getvalue(), file_name=Path(uploaded.name).name,
+                                       mime="image/svg+xml", key=f"preview_svg_{label}_{uploaded.name}")
+                else:
+                    try:
+                        from PIL import Image
+                        image = Image.open(io.BytesIO(uploaded.getvalue()))
+                        image.thumbnail((1600, 1200))
+                        if image.mode not in ("RGB", "RGBA"):
+                            image = image.convert("RGBA" if "transparency" in image.info else "RGB")
+                        st.image(image, caption=uploaded.name, use_container_width=True)
+                    except Exception as exc:
+                        st.warning(f"Could not preview this image: {exc}")
+
+        table_uploads = [
+            ("METAR/SPECI", metar_upload),
+            ("LLWAS", llwas_upload),
+            ("Pilot report", pirep_upload),
+        ]
+        for label, uploaded in table_uploads:
+            if uploaded is None:
+                continue
+            st.markdown(f"**{label}: {uploaded.name}**")
+            suffix = Path(uploaded.name).suffix.lower()
+            try:
+                if suffix == ".csv":
+                    preview = pd.read_csv(io.BytesIO(uploaded.getvalue()), encoding="utf-8-sig", nrows=100)
+                    st.dataframe(preview, use_container_width=True, hide_index=True)
+                    st.caption("Showing up to the first 100 rows.")
+                elif suffix in (".xls", ".xlsx"):
+                    engine = "xlrd" if suffix == ".xls" else "openpyxl"
+                    preview = pd.read_excel(io.BytesIO(uploaded.getvalue()), engine=engine, nrows=100)
+                    st.dataframe(preview, use_container_width=True, hide_index=True)
+                    st.caption("Showing up to the first 100 rows.")
+                else:
+                    text = uploaded.getvalue().decode("utf-8-sig", errors="replace")
+                    st.code("\n".join(text.splitlines()[:100]), language="text")
+                    st.caption("Showing up to the first 100 lines.")
+            except Exception as exc:
+                st.warning(f"Could not preview this file: {exc}")
+
+    sources = [
+        ("Radar", "comprehensive_radar", "Radar Analyze"),
+        ("Satellite", ("comprehensive_satellite_field", "comprehensive_satellite_motion", "comprehensive_satellite_dense", "comprehensive_satellite_cooling"), "Satellite Analyze"),
+        ("Surface · METAR/SPECI", "comprehensive_metar", "Surface Analyze"),
+        ("Surface · LLWAS", "comprehensive_llwas", "Surface Analyze"),
+        ("Upper air sounding", "comprehensive_sounding", "Upper Air Analyze"),
+        ("Pilot report", ("comprehensive_pirep", "comprehensive_pirep_upload"), "Pilot Report"),
+    ]
+    rows = []
+    for label, keys, menu in sources:
+        keys = (keys,) if isinstance(keys, str) else keys
+        analyzed = [key for key in keys if key in state]
+        files = attached[label]
+        if analyzed:
+            status = "Analyzed / available"
+            details = "; ".join(str(state[key].get("file", ", ".join(state[key].get("files", [])))) for key in analyzed)
+        elif files:
+            status = "File attached · not analyzed"
+            details = ", ".join(files)
+        else:
+            status = "Not attached / analyzed"
+            details = f"Attach above or use {menu}"
+        rows.append({"Source": label, "Status": status, "Details": details})
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    st.markdown("#### Your written analysis")
+    st.caption("Use the toolbar to format text like a Word document: paragraph styles, bold/italic/underline, font size/color, alignment, lists, indentation and links.")
+    from streamlit_quill import st_quill
+    analysis_html = st_quill(
+        value=state.get("comprehensive_analysis_html", ""),
+        placeholder="Enter event context, observations, source-by-source interpretation, alignment, uncertainty, and follow-up checks…",
+        html=True,
+        toolbar=[
+            [{"header": [1, 2, 3, False]}, {"size": ["small", False, "large", "huge"]}],
+            ["bold", "italic", "underline", "strike"],
+            [{"color": []}, {"background": []}],
+            [{"list": "ordered"}, {"list": "bullet"}, {"indent": "-1"}, {"indent": "+1"}],
+            [{"align": []}],
+            ["blockquote", "link", "clean"],
+        ],
+        key="comprehensive_analysis_editor",
+    ) or ""
+    state["comprehensive_analysis_html"] = analysis_html
+    if analysis_html.strip():
+        import bleach
+        preview_html = bleach.clean(
+            analysis_html,
+            tags={"p", "br", "strong", "b", "em", "i", "u", "s", "ol", "ul", "li", "h1", "h2", "h3", "span", "blockquote", "a"},
+            attributes={"span": ["style"], "a": ["href", "title"], "p": ["style"], "h1": ["style"], "h2": ["style"], "h3": ["style"]},
+            protocols={"http", "https", "mailto"},
+            strip=True,
+        )
+        with st.expander("Formatted preview", expanded=True):
+            st.markdown(preview_html, unsafe_allow_html=True)
+        st.download_button(
+            "Save analysis as Word document (.docx)",
+            data=make_analysis_docx(analysis_html),
+            file_name=f"comprehensive_analysis_{date.today().isoformat()}.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            key="download_comprehensive_docx",
+        )
+
+    if not any(row["Status"] == "Analyzed / available" for row in rows):
+        st.info("No source analysis results are available yet. Files attached above are inventoried only; run the relevant source analysis to generate summaries.")
+
+    for title, key in (
+        ("Radar analysis", "comprehensive_radar"),
+        ("Satellite single-field plot", "comprehensive_satellite_field"),
+        ("Satellite two-scene motion", "comprehensive_satellite_motion"),
+        ("Satellite dense motion", "comprehensive_satellite_dense"),
+        ("Satellite cooling diagnostics", "comprehensive_satellite_cooling"),
+        ("METAR/SPECI summary", "comprehensive_metar"),
+        ("LLWAS summary", "comprehensive_llwas"),
+        ("Upper-air sounding summary", "comprehensive_sounding"),
+        ("Pilot report date lookup", "comprehensive_pirep"),
+    ):
+        if key in state:
+            with st.expander(title, expanded=False):
+                st.json(state[key])
+
+    st.warning("Time and location alignment is not inferred across sources. Confirm observation times, station/sensor identities, units, coverage, and quality independently before comparing evidence. Missing inputs must not be interpreted as normal conditions.")
+    st.error("Research and advisory use only. Radar attenuation, satellite motion/cooling, and parsed observations are provisional; this overview is not a validated operational warning, clearance, or flight-deck decision.")
+
+
+tabs = st.tabs(["Radar Analyze", "Satellite Analyze", "Surface Analyze", "Upper Air Analyze", "Pilot Report", "Comprehensive Analysis"])
 with tabs[0]: radar_tab()
 with tabs[1]: satellite_tab()
 with tabs[2]: surface_tab()
 with tabs[3]: upper_air_tab()
 with tabs[4]: pilot_tab()
+with tabs[5]: comprehensive_tab()
 
 st.caption("Derived radar attenuation and satellite motion/cooling displays are provisional research products only—not validated operational decisions.")
