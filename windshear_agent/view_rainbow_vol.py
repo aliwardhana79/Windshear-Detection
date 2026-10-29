@@ -125,27 +125,38 @@ def display(path: Path, sweep_number: int | None = None, save: Path | None = Non
 def add_map_context(ax):
     """Plot geographic context, including the Juanda KKOP overlay."""
     bounds = (112.1, 113.25, -8.15, -6.8)
+    packaged_context = Path(__file__).parent / "assets" / "radar_map_context.json"
     cache = TRAINING_ROOT / "01_output/Radar/CTV699_20250307/_map_cache"
     try:
-        ocean_path = cache / "ne_10m_ocean/ne_10m_ocean.shp"
-        if ocean_path.exists():
-            for segment in shapefile_segments(ocean_path, bounds):
-                ax.plot(segment[:, 0], segment[:, 1], color="#08799c", linewidth=1.15,
-                        alpha=0.95, solid_capstyle="round", zorder=8)
-            ax.text(112.60, -7.02, "Java Sea", color="#155b78", fontsize=10,
-                    weight="bold", ha="center", zorder=20)
+        if packaged_context.is_file():
+            context = json.loads(packaged_context.read_text(encoding="utf-8"))
+            for segment in context.get("coastline", []):
+                points = np.asarray(segment, dtype=float)
+                if len(points) > 1:
+                    ax.plot(points[:, 0], points[:, 1], color="#08799c", linewidth=1.15,
+                            alpha=0.95, solid_capstyle="round", zorder=8)
+            for segment in context.get("administrative", []):
+                points = np.asarray(segment, dtype=float)
+                if len(points) > 1:
+                    ax.plot(points[:, 0], points[:, 1], color="#202b37", linewidth=1.0,
+                            alpha=0.95, solid_capstyle="round", zorder=9)
+        else:
+            ocean_path = cache / "ne_10m_ocean/ne_10m_ocean.shp"
+            if ocean_path.exists():
+                for segment in shapefile_segments(ocean_path, bounds):
+                    ax.plot(segment[:, 0], segment[:, 1], color="#08799c", linewidth=1.15,
+                            alpha=0.95, solid_capstyle="round", zorder=8)
+            admin_path = cache / "gadm41_IDN/gadm41_IDN_1.shp"
+            if admin_path.exists():
+                for segment in shapefile_segments(admin_path, bounds):
+                    ax.plot(segment[:, 0], segment[:, 1], color="#202b37", linewidth=1.0,
+                            alpha=0.95, solid_capstyle="round", zorder=9)
+        ax.text(112.60, -7.02, "Java Sea", color="#155b78", fontsize=10,
+                weight="bold", ha="center", zorder=20)
+        ax.text(112.91, -7.52, "East Java", color="#3f382f", fontsize=10,
+                weight="bold", ha="center", zorder=20)
     except Exception as exc:
-        print(f"Map note: coastline layer unavailable: {exc}")
-    try:
-        admin_path = cache / "gadm41_IDN/gadm41_IDN_1.shp"
-        if admin_path.exists():
-            for segment in shapefile_segments(admin_path, bounds):
-                ax.plot(segment[:, 0], segment[:, 1], color="#202b37", linewidth=1.0,
-                        alpha=0.95, solid_capstyle="round", zorder=9)
-            ax.text(112.91, -7.52, "East Java", color="#3f382f", fontsize=10,
-                    weight="bold", ha="center", zorder=20)
-    except Exception as exc:
-        print(f"Map note: administrative boundaries unavailable: {exc}")
+        print(f"Map coastline/admin context unavailable: {exc}")
     try:
         with KKOP_GEOJSON.open(encoding="utf-8") as source:
             collection = json.load(source)
