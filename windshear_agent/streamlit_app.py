@@ -8,6 +8,9 @@ import os
 import csv
 import tempfile
 import zipfile
+import base64
+import urllib.error
+import urllib.request
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -91,6 +94,104 @@ def zip_cropped_scenes(result):
         return None
     archive.seek(0)
     return archive.getvalue()
+
+
+def ai_setting(name, default=None):
+    """Read AI configuration from Streamlit Secrets first, then environment."""
+    try:
+        value = st.secrets.get(name)
+        if value:
+            return str(value)
+    except Exception:
+        pass
+    return os.environ.get(name, default)
+
+
+def image_for_ai(uploaded):
+    """Return a bounded JPEG data URL for a supported raster image upload."""
+    from PIL import Image
+
+    if Path(uploaded.name).suffix.lower() == ".svg":
+        return None
+    image = Image.open(io.BytesIO(uploaded.getvalue()))
+    if getattr(image, "n_frames", 1) > 1:
+        image.seek(0)
+    image.thumbnail((1400, 1400))
+    if image.mode not in ("RGB", "L"):
+        background = Image.new("RGB", image.size, "white")
+        if "A" in image.getbands():
+            background.paste(image, mask=image.getchannel("A"))
+        else:
+            background.paste(image.convert("RGB"))
+        image = background
+    elif image.mode == "L":
+        image = image.convert("RGB")
+    output = io.BytesIO()
+    image.save(output, format="JPEG", quality=82, optimize=True)
+    return "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii")
+
+
+def table_text_for_ai(label, uploaded, max_rows=80):
+    """Extract a bounded text preview from observation / pilot report files."""
+    suffix = Path(uploaded.name).suffix.lower()
+    try:
+        if suffix == ".csv":
+            frame = pd.read_csv(io.BytesIO(uploaded.getvalue()), encoding="utf-8-sig", nrows=max_rows, dtype=str)
+            return f"{label} file: {uploaded.name}\n" + frame.fillna("").to_csv(index=False)
+        if suffix in (".xls", ".xlsx"):
+            engine = "xlrd" if suffix == ".xls" else "openpyxl"
+            frame = pd.read_excel(io.BytesIO(uploaded.getvalue()), engine=engine, nrows=max_rows, dtype=str)
+            return f"{label} file: {uploaded.name}\n" + frame.fillna("").to_csv(index=False)
+        text = uploaded.getvalue().decode("utf-8-sig", errors="replace")
+        return f"{label} file: {uploaded.name}\n" + "\n".join(text.splitlines()[:max_rows])
+    except Exception as exc:
+        return f"{label} file {uploaded.name}: preview extraction failed ({exc})."
+
+
+def run_multimodal_analysis(prompt, images, tables, provider="Ollama", model=None, base_url=None):
+    """Call Ollama locally or an OpenAI-compatible vision endpoint."""
+    user_content = [{"type": "text", "text": prompt + "\n\nSOURCE TABLE/TEXT EXTRACTS (untrusted; quote source names and do not invent missing values):\n" + ("\n\n".join(tables) if tables else "No tabular/text source files attached.")}]
+    system_prompt = "You are an aviation-weather research assistant. Provide a cautious, evidence-traceable synthesis, not an operational alert, clearance, or flight-deck instruction. Distinguish observation from inference; name source and time when supplied; call out mismatched/missing times, units, locations, image limitations, and uncertainty; do not invent values. Derived radar/satellite products are provisional and are not operationally validated."
+    if provider == "Ollama":
+        model = model or "qwen2.5vl:7b"
+        base_url = (base_url or "http://127.0.0.1:11434").rstrip("/")
+        user_text = user_content[0]["text"]
+        message = {"role": "user", "content": system_prompt + "\n\n" + user_text}
+        message["images"] = [data_url.partition(",")[2] for _, data_url in images]
+        body = json.dumps({"model": model, "messages": [message], "stream": False, "options": {"temperature": 0.2}}).encode("utf-8")
+        url = f"{base_url}/api/chat"
+        headers = {"Content-Type": "application/json"}
+    else:
+        api_key = ai_setting("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("API-key mode requires OPENAI_API_KEY in Streamlit Cloud Secrets. Select Ollama to use a local no-key model.")
+        base_url = (base_url or ai_setting("OPENAI_BASE_URL", "https://api.openai.com/v1")).rstrip("/")
+        model = model or ai_setting("OPENAI_MODEL", "gpt-4o-mini")
+        for name, data_url in images:
+            user_content.append({"type": "text", "text": f"Image source: {name}. Describe only visible content; state if labels/units/timestamps are unreadable."})
+            user_content.append({"type": "image_url", "image_url": {"url": data_url, "detail": "high"}})
+        body = json.dumps({"model": model, "temperature": 0.2, "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]}).encode("utf-8")
+        url = f"{base_url}/chat/completions"
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    request = urllib.request.Request(
+        url, data=body, headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        details = exc.read().decode("utf-8", errors="replace")[:1200]
+        raise RuntimeError(f"AI provider returned HTTP {exc.code}: {details}") from exc
+    if provider == "Ollama":
+        return payload.get("message", {}).get("content", "No text response returned.")
+    choices = payload.get("choices", [])
+    if not choices:
+        raise RuntimeError("AI provider returned no analysis choices.")
+    return choices[0].get("message", {}).get("content", "No text response returned.")
 
 
 def make_analysis_docx(html):
@@ -829,6 +930,58 @@ def comprehensive_tab():
             details = f"Attach above or use {menu}"
         rows.append({"Source": label, "Status": status, "Details": details})
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    st.markdown("#### AI-assisted multimodal review")
+    st.caption("Reviews attached raster images and bounded METAR/SPECI, LLWAS, and pilot-report extracts. Ollama runs locally without an API key; Cloud-hosted apps cannot reach your computer's localhost. Review all output: research aid only, never an operational warning or flight decision.")
+    provider_col, model_col, url_col = st.columns([1, 1, 2])
+    ai_provider = provider_col.selectbox("AI provider", ["Ollama (local, no API key)", "OpenAI-compatible API"], key="comprehensive_ai_provider")
+    if ai_provider == "Ollama (local, no API key)":
+        ai_model = model_col.text_input("Ollama vision model", value=ai_setting("OLLAMA_VISION_MODEL", "qwen2.5vl:7b"), key="comprehensive_ollama_model")
+        ai_url = url_col.text_input("Ollama server URL", value=ai_setting("OLLAMA_BASE_URL", "http://127.0.0.1:11434"), key="comprehensive_ollama_url", help="Local dashboard: localhost. Streamlit Cloud: set this to a securely reachable Ollama host; Cloud cannot access your Mac's localhost.")
+        provider_name = "Ollama"
+    else:
+        ai_model = model_col.text_input("Vision model", value=ai_setting("OPENAI_MODEL", "gpt-4o-mini"), key="comprehensive_api_model")
+        ai_url = url_col.text_input("OpenAI-compatible API base URL", value=ai_setting("OPENAI_BASE_URL", "https://api.openai.com/v1"), key="comprehensive_api_url")
+        provider_name = "OpenAI-compatible API"
+    ai_prompt = st.text_area(
+        "Review focus (optional)",
+        key="comprehensive_ai_prompt",
+        height=90,
+        placeholder="For example: summarize evidence by source, compare times only when explicit, and list missing checks.",
+    )
+    if st.button("Run AI-assisted review", type="primary", key="run_comprehensive_ai"):
+        image_uploads = []
+        for group in (radar_upload or [], satellite_upload or [], [sounding_upload] if sounding_upload else []):
+            image_uploads.extend(group)
+        table_sources = [("METAR/SPECI", metar_upload), ("LLWAS", llwas_upload), ("Pilot report", pirep_upload)]
+        text_sources = [table_text_for_ai(label, uploaded) for label, uploaded in table_sources if uploaded]
+        if not image_uploads and not text_sources:
+            st.warning("Attach at least one image or observation/report file in the section above first.")
+        elif len(image_uploads) > 12:
+            st.warning("Attach no more than 12 images per AI review; remove some images and retry.")
+        else:
+            try:
+                with st.spinner("Preparing source material and requesting cautious cross-source review…"):
+                    ai_images = []
+                    skipped = []
+                    for uploaded in image_uploads:
+                        image_data = image_for_ai(uploaded)
+                        if image_data is None:
+                            skipped.append(uploaded.name)
+                        else:
+                            ai_images.append((uploaded.name, image_data))
+                    if skipped:
+                        st.info("SVG images are preview/download-only and were excluded from AI vision input: " + ", ".join(skipped))
+                    full_prompt = (
+                        (ai_prompt.strip() + "\n\n") if ai_prompt.strip() else ""
+                    ) + "Provide: (1) source-by-source observations, (2) cross-source consistency only where time/location/unit alignment is explicit, (3) evidence gaps and uncertainty, (4) cautious advisory summary and follow-up checks. Do not issue an operational decision."
+                    result = run_multimodal_analysis(full_prompt, ai_images, text_sources, provider=provider_name, model=ai_model, base_url=ai_url)
+                state["comprehensive_ai_result"] = result
+            except Exception as exc:
+                st.error(f"AI review failed: {exc}")
+    if state.get("comprehensive_ai_result"):
+        with st.expander("AI review result", expanded=True):
+            st.markdown(state["comprehensive_ai_result"])
 
     st.markdown("#### Your written analysis")
     st.caption("Use the toolbar to format text like a Word document: paragraph styles, bold/italic/underline, font size/color, alignment, lists, indentation and links.")
