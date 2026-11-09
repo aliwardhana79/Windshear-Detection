@@ -5,8 +5,8 @@ from __future__ import annotations
 import io
 import json
 import csv
+import os
 import tempfile
-import zipfile
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -74,22 +74,123 @@ def uploaded_pairs(files):
     return [(f.name, f.getvalue()) for f in files]
 
 
-def zip_cropped_scenes(result):
-    """Package downloaded and already-present cropped NetCDF scenes for browser download."""
-    output_dir = Path(result["output_dir"])
-    names = list(dict.fromkeys(result.get("cropped_downloaded", []) + result.get("already_existing", [])))
-    archive = io.BytesIO()
-    added = 0
-    with zipfile.ZipFile(archive, mode="w", compression=zipfile.ZIP_STORED) as bundle:
-        for name in names:
-            path = output_dir / Path(name).name
-            if path.is_file():
-                bundle.write(path, arcname=path.name)
-                added += 1
-    if not added:
-        return None
-    archive.seek(0)
-    return archive.getvalue()
+def home_folder():
+    """Writable home directory, falling back to the app folder."""
+    home = Path.home()
+    if home.is_dir() and os.access(home, os.W_OK):
+        return home
+    return Path(__file__).resolve().parent
+
+
+def writable_folder(path):
+    """Return ``(resolved Path, problem)``; creates the folder if missing.
+
+    ``problem`` is None when the folder can be used for downloads.
+    """
+    try:
+        candidate = Path(str(path)).expanduser()
+    except (TypeError, ValueError) as exc:
+        return None, f"Invalid folder path: {exc}"
+    try:
+        if candidate.exists() and not candidate.is_dir():
+            return None, "That path is a file, not a folder."
+        candidate.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return None, f"Cannot create or open this folder: {exc}"
+    if not candidate.is_dir():
+        return None, "That path is not a folder."
+    try:
+        with tempfile.NamedTemporaryFile(dir=candidate, prefix=".windshear_", delete=True):
+            pass
+    except OSError as exc:
+        return None, f"That folder is not writable: {exc}"
+    return candidate.resolve(), None
+
+
+def default_output_dir():
+    """First writable candidate folder for Himawari downloads."""
+    for candidate in (home_folder() / "Himawari_9",
+                      Path(__file__).resolve().parent / "Himawari_9",
+                      Path.cwd() / "Himawari_9"):
+        parent = candidate.parent
+        if parent.is_dir() and os.access(parent, os.W_OK):
+            return str(candidate)
+    return str(Path.cwd())
+
+
+_TK_FOLDER_SCRIPT = r'''
+import sys
+
+if len(sys.argv) < 3:
+    raise SystemExit(4)
+
+initial, title = sys.argv[1], sys.argv[2]
+try:
+    import tkinter
+    from tkinter import filedialog
+except Exception:
+    raise SystemExit(3)
+
+try:
+    root = tkinter.Tk()
+except Exception:
+    raise SystemExit(3)
+
+try:
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+        root.lift()
+        root.focus_force()
+    except Exception:
+        pass
+    root.update_idletasks()
+    options = {"title": title, "mustexist": True}
+    if initial:
+        options["initialdir"] = initial
+    chosen = filedialog.askdirectory(**options)
+finally:
+    try:
+        root.destroy()
+    except Exception:
+        pass
+
+print(chosen or "")
+'''
+
+
+def native_folder_dialog(initial_dir=None, prompt="Select the Himawari output folder"):
+    """Open one cross-platform folder chooser.
+
+    The Tk dialog runs in a child process, so it never touches Streamlit's
+    script thread and the same code path is used on Windows, macOS and Linux.
+    Returns ``(path, status)`` with status ``selected``, ``cancelled`` or
+    ``unavailable``; a headless machine (no Tk or no display) returns
+    ``unavailable`` and the caller falls back to the in-page browser.
+    """
+    import subprocess
+    import sys
+
+    initial = Path(str(initial_dir)).expanduser() if initial_dir else None
+    if initial is not None and not initial.is_dir():
+        initial = None
+
+    try:
+        extra = {}
+        if sys.platform.startswith("win"):
+            extra["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        result = subprocess.run(
+            [sys.executable, "-c", _TK_FOLDER_SCRIPT, str(initial) if initial else "", prompt],
+            capture_output=True, text=True, timeout=600, **extra,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None, "unavailable"
+
+    if result.returncode != 0:
+        return None, "unavailable"
+
+    chosen = (result.stdout or "").strip()
+    return (chosen or None), ("selected" if chosen else "cancelled")
 
 
 def make_analysis_docx(html):
@@ -294,25 +395,41 @@ def satellite_tab():
     from satellite_analysis import (process_satellite_file, process_motion_files,
                                     process_convective_cooling_files, JUANDA_REGION, CTV699_REGION)
     from dense_amv_ctv699 import process_uploaded_sequence
-    from himawari_download import download_himawari, list_local_products, crop_saved_products
+    from himawari_download import download_himawari, list_local_products
 
     st.subheader("Himawari satellite")
-    st.caption("Three steps: download the full disk to a local folder, crop it to your area of interest, then analyse the cropped scenes locally.")
+    st.caption("Two steps: download the full disk to a local folder, then analyse scenes from that folder or an uploaded file.")
 
-    default_output_dir = str(Path("./Himawari_9").resolve())
+    initial_output_dir = default_output_dir()
     if "hima_output_dir_text" not in st.session_state:
-        st.session_state["hima_output_dir_text"] = default_output_dir
+        st.session_state["hima_output_dir_text"] = initial_output_dir
 
     def _toggle_browser():
         opening = not st.session_state.get("hima_browser_open", False)
         st.session_state["hima_browser_open"] = opening
         if opening:
             candidate = Path(st.session_state.get("hima_output_dir_text", "")).expanduser()
-            st.session_state["hima_browse_path"] = str(candidate if candidate.is_dir() else Path.home())
+            st.session_state["hima_browse_path"] = str(candidate if candidate.is_dir() else home_folder())
 
     def _use_folder(path):
         st.session_state["hima_output_dir_text"] = path
         st.session_state["hima_browser_open"] = False
+
+    def _pick_native():
+        candidate = Path(st.session_state.get("hima_output_dir_text", "")).expanduser()
+        if st.session_state.get("hima_native_unavailable"):
+            # The system dialog failed before; go straight to the in-page browser.
+            st.session_state["hima_browse_path"] = str(candidate if candidate.is_dir() else home_folder())
+            st.session_state["hima_browser_open"] = True
+            return
+        path, status = native_folder_dialog(candidate)
+        if status == "selected" and path:
+            st.session_state["hima_output_dir_text"] = path
+            st.session_state["hima_browser_open"] = False
+        elif status == "unavailable":
+            st.session_state["hima_native_unavailable"] = True
+            st.session_state["hima_browse_path"] = str(candidate if candidate.is_dir() else home_folder())
+            st.session_state["hima_browser_open"] = True
 
     def _go(path):
         st.session_state["hima_browse_path"] = str(path)
@@ -332,16 +449,33 @@ def satellite_tab():
             st.session_state["hima_folder_error"] = str(exc)
 
     def _render_folder_browser():
-        current = Path(st.session_state.get("hima_browse_path") or Path.home()).expanduser()
+        current = Path(st.session_state.get("hima_browse_path") or home_folder()).expanduser()
         if not current.is_dir():
-            current = Path.home()
+            current = home_folder()
         st.session_state["hima_browse_path"] = str(current)
         st.caption(f"Current folder: `{current}`")
+        _, problem = writable_folder(current)
+        if problem:
+            st.warning(f"{problem} Choose a folder you can write to.")
+        st.button("Choose this folder", key="hima_use_folder", type="primary",
+                  on_click=_use_folder, args=(str(current),), disabled=bool(problem))
+        st.button("Close browser", key="hima_close_browser", on_click=_toggle_browser,
+                  type="tertiary")
         nav = st.columns([1, 1, 4])
         nav[0].button("\u2191 Parent", key="hima_dir_up", on_click=_go,
                       args=(str(current.parent),), use_container_width=True)
         nav[1].button("Home", key="hima_dir_home", on_click=_go,
-                      args=(str(Path.home()),), use_container_width=True)
+                      args=(str(home_folder()),), use_container_width=True)
+        if os.name == "nt" and current.parent == current:
+            drives = [Path(f"{letter}:\\") for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ"
+                      if Path(f"{letter}:\\").exists()]
+            if drives:
+                st.caption("Drives")
+                drive_cols = st.columns(min(len(drives), 6))
+                for index, drive in enumerate(drives):
+                    drive_cols[index % len(drive_cols)].button(
+                        str(drive), key=f"hima_drive_{drive.drive}", on_click=_go,
+                        args=(str(drive),), use_container_width=True)
         try:
             subdirs = sorted((p for p in current.iterdir() if p.is_dir() and not p.name.startswith(".")),
                              key=lambda p: p.name.lower())
@@ -366,8 +500,6 @@ def satellite_tab():
                         args=(str(current),), use_container_width=True)
         if st.session_state.get("hima_folder_error"):
             st.error(st.session_state["hima_folder_error"])
-        st.button(f"Use this folder: {current}", key="hima_use_folder", type="primary",
-                  on_click=_use_folder, args=(str(current),))
 
     # ---------------- Step 1: download the full disk ----------------
     st.markdown("#### Step 1 · Download the full disk to a local folder")
@@ -383,111 +515,84 @@ def satellite_tab():
         c1, c2 = st.columns([4, 1], vertical_alignment="bottom")
         output_dir = c1.text_input("Local output folder (type a path or browse)",
                                    key="hima_output_dir_text")
-        c2.button("Browse\u2026", key="hima_browse_btn", on_click=_toggle_browser,
-                  use_container_width=True)
+        c2.button("Browse\u2026", key="hima_browse_btn", on_click=_pick_native,
+                  use_container_width=True,
+                  help="Opens the system folder chooser. If that is not available, "
+                       "a folder browser opens inside this page.")
+        if st.session_state.get("hima_native_unavailable"):
+            st.caption("The system folder dialog is unavailable because this Python has no Tk support. "
+                       "Use the folder browser below, or install `python-tk` for this Python.")
+        elif not st.session_state.get("hima_browser_open"):
+            st.button("Browse folders in this page instead", key="hima_browse_inline",
+                      on_click=_toggle_browser, type="tertiary")
         if st.session_state.get("hima_browser_open"):
             with st.container(border=True):
                 _render_folder_browser()
         if st.button("Download full disk", key="download_hima_full", type="primary"):
-            progress = st.progress(0, text="Starting download…")
-            try:
-                def update(p):
-                    progress.progress(min(100, int(p.get("percent", 0))),
-                                      text=f"{p.get('stage', '')} · {p.get('current_time', '')}")
-                result = download_himawari(username, password,
-                                           start.strftime("%Y%m%d%H%M"), end.strftime("%Y%m%d%H%M"),
-                                           None, output_dir, interval, update, crop=False)
-                st.success(f"Saved {len(result['full_disk_downloaded'])} new full-disk scene(s) to {result['output_dir']}")
-                st.caption("Full-disk files stay on disk. Crop them in Step 2.")
-                if result["not_found"]:
-                    with st.expander(f"Not available at JAXA ({len(result['not_found'])})"):
-                        st.dataframe(pd.DataFrame(result["not_found"]), use_container_width=True, hide_index=True)
-                if result["failed"]:
-                    st.warning(f"{len(result['failed'])} download(s) failed.")
-                    with st.expander("Failure detail"):
-                        st.dataframe(pd.DataFrame(result["failed"]), use_container_width=True, hide_index=True)
-            except Exception as exc:
-                st.error(f"Download failed: {exc}")
+            target, problem = writable_folder(output_dir)
+            if problem:
+                st.error(f"{problem} Choose a writable folder, for example `{home_folder() / 'Himawari_9'}`.")
+            else:
+                progress = st.progress(0, text="Starting download…")
+                try:
+                    def update(p):
+                        progress.progress(min(100, int(p.get("percent", 0))),
+                                          text=f"{p.get('stage', '')} · {p.get('current_time', '')}")
+                    result = download_himawari(username, password,
+                                               start.strftime("%Y%m%d%H%M"), end.strftime("%Y%m%d%H%M"),
+                                               None, str(target), interval, update, crop=False)
+                    st.success(f"Saved {len(result['full_disk_downloaded'])} new full-disk scene(s) to {result['output_dir']}")
+                    st.caption("Full-disk files stay on disk on this machine; analyse them in Step 2.")
+                    if result["not_found"]:
+                        with st.expander(f"Not available at JAXA ({len(result['not_found'])})"):
+                            st.dataframe(pd.DataFrame(result["not_found"]), use_container_width=True, hide_index=True)
+                    if result["failed"]:
+                        st.warning(f"{len(result['failed'])} download(s) failed.")
+                        with st.expander("Failure detail"):
+                            st.dataframe(pd.DataFrame(result["failed"]), use_container_width=True, hide_index=True)
+                except Exception as exc:
+                    st.error(f"Download failed: {exc}")
 
-    # ---------------- Step 2: crop to a lat/lon box ----------------
-    st.markdown("#### Step 2 · Crop a saved full disk to a latitude/longitude box")
-    inventory = list_local_products(output_dir)
-    full_disk = inventory["full_disk"]
-    if not inventory["exists"]:
-        st.info(f"Folder not found yet: {inventory['root']}")
-    elif not full_disk:
-        st.info(f"No full-disk scenes in {inventory['root']} yet. Download them in Step 1.")
-    else:
-        full_bytes = sum(item["size_bytes"] for item in full_disk)
-        st.caption(f"{len(full_disk)} full-disk scene(s) · {full_bytes / 1e9:.2f} GB in {inventory['root']}")
-        chosen = st.multiselect("Full-disk scene(s) to crop", [item["name"] for item in full_disk],
-                                default=[full_disk[-1]["name"]], key="hima_crop_sources")
-        c1, c2 = st.columns(2)
-        south = c1.number_input("South latitude", value=-8.15, format="%.4f", key="hima_crop_south")
-        north = c2.number_input("North latitude", value=-6.80, format="%.4f", key="hima_crop_north")
-        c1, c2 = st.columns(2)
-        west = c1.number_input("West longitude", value=112.10, format="%.4f", key="hima_crop_west")
-        east = c2.number_input("East longitude", value=113.25, format="%.4f", key="hima_crop_east")
-        st.caption("The ROI copy is written next to the full disk; the original file is not modified.")
-        if st.button("Crop selected scene(s)", key="crop_hima"):
-            try:
-                outcomes = crop_saved_products(output_dir, chosen, south, north, west, east)
-                created = [o for o in outcomes if o["status"] == "cropped"]
-                already = [o for o in outcomes if o["status"] == "already_exists"]
-                failed = [o for o in outcomes if o["status"] == "failed"]
-                if created:
-                    st.success(f"Cropped {len(created)} scene(s) to {south}–{north}°N, {west}–{east}°E.")
-                if already:
-                    st.info(f"{len(already)} crop(s) already existed and were left unchanged.")
-                if failed:
-                    st.error(f"{len(failed)} crop(s) failed.")
-                if outcomes:
-                    st.dataframe(pd.DataFrame(outcomes), use_container_width=True, hide_index=True)
-            except Exception as exc:
-                st.error(f"Cropping failed: {exc}")
-
-    roi = list_local_products(output_dir)["roi"]
-    if roi:
-        st.caption(f"{len(roi)} cropped scene(s) ready for analysis.")
-        st.dataframe(pd.DataFrame([{
-            "file": item["name"],
-            "size_MB": round(item["size_bytes"] / 1e6, 1),
-            "south": (item.get("bounds") or {}).get("south"),
-            "north": (item.get("bounds") or {}).get("north"),
-            "west": (item.get("bounds") or {}).get("west"),
-            "east": (item.get("bounds") or {}).get("east"),
-            "modified": item["modified"],
-        } for item in roi]), use_container_width=True, hide_index=True)
-        archive = zip_cropped_scenes({"output_dir": output_dir, "cropped_downloaded": [],
-                                      "already_existing": [item["name"] for item in roi]})
-        if archive:
-            st.download_button(f"Download all {len(roi)} cropped scene(s) (.zip)", data=archive,
-                               file_name="himawari_roi.zip", mime="application/zip", key="download_hima_zip")
-
-    # ---------------- Step 3: analyse the crops ----------------
-    st.markdown("#### Step 3 · Analyse the cropped scenes")
+    # ---------------- Step 2: analyse scenes ----------------
+    st.markdown("#### Step 2 · Analyse scenes from the local folder or an upload")
     root = Path(output_dir).expanduser().resolve()
-    roi_names = [item["name"] for item in roi]
-    use_local = st.toggle("Read scenes from the local output folder (no upload)", value=bool(roi_names),
+    inventory = list_local_products(root)
+    local_names = [item["name"] for item in inventory["roi"] + inventory["full_disk"]]
+    if not inventory["exists"]:
+        st.info(f"Folder does not exist yet: {inventory['root']} — it is created on the first download.")
+    elif not local_names:
+        st.info(f"No scene files in {inventory['root']} yet. Download them in Step 1, or turn the toggle off to upload a file.")
+    else:
+        st.caption(f"{len(inventory['full_disk'])} full-disk and {len(inventory['roi'])} cropped scene(s) in {inventory['root']}")
+
+    use_local = st.toggle("Read scenes from the local output folder (no upload)", value=bool(local_names),
                           key="sat_use_local",
-                          help="Uses the cropped ROI files from Step 2. Turn off to analyse a file uploaded from the browser instead.")
-    if use_local and not roi_names:
-        st.info("No cropped scenes yet. Crop a full disk in Step 2, or turn this toggle off to upload a file.")
-    region = None if use_local else JUANDA_REGION
+                          help="Reads scenes saved in Step 1 and any ROI crops already on disk. "
+                               "Turn off to analyse a file uploaded from the browser instead.")
+    if use_local and not local_names:
+        st.info("No local scenes yet. Download in Step 1, or turn this toggle off to upload a file.")
+
+    def is_roi(name):
+        return "_ROI_" in Path(name).name
+
+    def local_region(name):
+        # ROI crops already cover the analysis box (use the file's own extent);
+        # full-disk scenes are sliced to the default Juanda window.
+        return None if is_roi(name) else JUANDA_REGION
 
     def read_local(name):
         return (name, (root / name).read_bytes())
 
     def pick_many(label, key):
         if use_local:
-            names = st.multiselect(label, roi_names, key=f"{key}_local")
+            names = st.multiselect(label, local_names, key=f"{key}_local")
             return [read_local(name) for name in names]
         files = st.file_uploader(label, type=NC_TYPES, accept_multiple_files=True, key=key, max_upload_size=800)
         return uploaded_pairs(files or [])
 
     def pick_one(label, key):
         if use_local:
-            name = st.selectbox(label, [""] + roi_names, key=f"{key}_local")
+            name = st.selectbox(label, [""] + local_names, key=f"{key}_local")
             return read_local(name) if name else None
         uploaded = st.file_uploader(label, type=NC_TYPES, key=key, max_upload_size=800)
         return (uploaded.name, uploaded.getvalue()) if uploaded else None
@@ -501,7 +606,8 @@ def satellite_tab():
         else:
             try:
                 with st.spinner("Reading and plotting the field…"):
-                    out = process_satellite_file(single[0], single[1], variable, region=region)
+                    region_choice = local_region(single[0]) if use_local else JUANDA_REGION
+                    out = process_satellite_file(single[0], single[1], variable, region=region_choice)
                 st.session_state["comprehensive_satellite_field"] = {
                     "file": out.get("filename"), "variable": out.get("variable"),
                     "long_name": out.get("long_name"), "units": out.get("units"),
@@ -526,8 +632,10 @@ def satellite_tab():
             st.error("Choose both scenes.")
         else:
             try:
+                if use_local and local_region(later[0]) != local_region(earlier[0]):
+                    raise ValueError("Choose two scenes of the same kind: both full-disk or both cropped to one box.")
                 with st.spinner("Tracking image features…"):
-                    result = process_motion_files([earlier, later], region=region)
+                    result = process_motion_files([earlier, later], region=local_region(earlier[0]) if use_local else JUANDA_REGION)
                 st.session_state["comprehensive_satellite_motion"] = {
                     "files": [earlier[0], later[0]],
                     "bands": [{k: v for k, v in band.items() if k not in ("preview",)} for band in result.get("bands", [])],
@@ -573,7 +681,8 @@ def satellite_tab():
         else:
             try:
                 with st.spinner("Calculating Band 13 diagnostics…"):
-                    result = process_convective_cooling_files(cooling_files, region=None if use_local else CTV699_REGION)
+                    region_choice = None if use_local and is_roi(cooling_files[0][0]) else CTV699_REGION
+                    result = process_convective_cooling_files(cooling_files, region=region_choice)
                 st.session_state["comprehensive_satellite_cooling"] = {
                     "files": [f[0] for f in cooling_files],
                     "statistics": result.get("statistics", []),
