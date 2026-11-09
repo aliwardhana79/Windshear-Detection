@@ -6,6 +6,7 @@ import io
 import json
 import csv
 import os
+import sys
 import tempfile
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -82,11 +83,38 @@ def home_folder():
     return Path(__file__).resolve().parent
 
 
+def foreign_path_problem(path_text):
+    """Return a message when a path was written for a different operating system."""
+    text = str(path_text or "").strip()
+    drive_path = (len(text) >= 3 and text[0].isalpha() and text[1] == ":"
+                  and text[2] in "\\/")
+    unc_path = text.startswith("\\\\")
+    if os.name == "nt":
+        if text.startswith("/") and not drive_path and not unc_path:
+            return ("This looks like a macOS/Linux path. On Windows use the drive form, "
+                    "e.g. C:\\Users\\<you>\\Himawari_9 or D:\\Himawari_9.")
+        return None
+    if drive_path or unc_path:
+        example = "/Users/<you>/Himawari_9" if sys.platform == "darwin" else "/home/<you>/Himawari_9"
+        system = "macOS" if sys.platform == "darwin" else "Linux"
+        return (f"This looks like a Windows path. On {system} use the form {example}.")
+    if sys.platform == "darwin" and (
+        text == "/home" or text.startswith("/home/")
+        or text == "/root" or text.startswith("/root/")
+        or text.startswith("/mnt/")
+    ):
+        return "This looks like a Linux path. On macOS use the form /Users/<you>/Himawari_9."
+    return None
+
+
 def writable_folder(path):
     """Return ``(resolved Path, problem)``; creates the folder if missing.
 
     ``problem`` is None when the folder can be used for downloads.
     """
+    problem = foreign_path_problem(path)
+    if problem:
+        return None, problem
     try:
         candidate = Path(str(path)).expanduser()
     except (TypeError, ValueError) as exc:
@@ -159,14 +187,84 @@ print(chosen or "")
 '''
 
 
+def os_native_folder_dialog(initial_dir=None, prompt="Select the Himawari output folder"):
+    """OS folder chooser used when the interpreter has no Tk support.
+
+    Finder's *choose folder* on macOS, the Shell folder dialog on Windows and
+    ``zenity`` on Linux. Returns the same ``(path, status)`` tuple as
+    :func:`native_folder_dialog`.
+    """
+    import subprocess
+    import sys
+
+    initial = Path(str(initial_dir)).expanduser() if initial_dir else None
+    if initial is not None and not initial.is_dir():
+        initial = None
+
+    if sys.platform == "darwin":
+        script = f'POSIX path of (choose folder with prompt "{prompt}"'
+        if initial is not None:
+            script += f' default location POSIX file "{str(initial).replace(chr(34), chr(92) + chr(34))}"'
+        script += ")"
+        try:
+            result = subprocess.run(["osascript", "-e", script],
+                                    capture_output=True, text=True, timeout=600)
+        except (OSError, subprocess.TimeoutExpired):
+            return None, "unavailable"
+        if result.returncode == 0:
+            chosen = (result.stdout or "").strip()
+            return (str(Path(chosen)), "selected") if chosen else (None, "cancelled")
+        if "-128" in (result.stderr or "") or "cancel" in (result.stderr or "").lower():
+            return None, "cancelled"
+        return None, "unavailable"
+
+    if sys.platform.startswith("win"):
+        quoted_prompt = prompt.replace("'", "''")
+        quoted_initial = str(initial).replace("'", "''") if initial is not None else ""
+        script = ("Add-Type -AssemblyName System.Windows.Forms;"
+                  "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog;"
+                  f"$dialog.Description = '{quoted_prompt}';"
+                  "$dialog.ShowNewFolderButton = $true;")
+        if quoted_initial:
+            script += f"$dialog.SelectedPath = '{quoted_initial}';"
+        script += ("$answer = $dialog.ShowDialog();"
+                   "if ($answer -eq [System.Windows.Forms.DialogResult]::OK) {"
+                   " Write-Output $dialog.SelectedPath }")
+        for executable in ("powershell", "pwsh"):
+            try:
+                result = subprocess.run([executable, "-NoProfile", "-STA", "-Command", script],
+                                        capture_output=True, text=True, timeout=600)
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if result.returncode != 0:
+                continue
+            lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+            if lines:
+                return str(Path(lines[-1])), "selected"
+            return None, "cancelled"
+        return None, "unavailable"
+
+    try:
+        result = subprocess.run(["zenity", "--file-selection", "--directory",
+                                 f"--title={prompt}"],
+                                capture_output=True, text=True, timeout=600)
+    except (OSError, subprocess.TimeoutExpired):
+        return None, "unavailable"
+    if result.returncode == 0:
+        chosen = (result.stdout or "").strip()
+        return (str(Path(chosen)), "selected") if chosen else (None, "cancelled")
+    return None, "cancelled"
+
+
 def native_folder_dialog(initial_dir=None, prompt="Select the Himawari output folder"):
     """Open one cross-platform folder chooser.
 
     The Tk dialog runs in a child process, so it never touches Streamlit's
     script thread and the same code path is used on Windows, macOS and Linux.
-    Returns ``(path, status)`` with status ``selected``, ``cancelled`` or
-    ``unavailable``; a headless machine (no Tk or no display) returns
-    ``unavailable`` and the caller falls back to the in-page browser.
+    If the interpreter has no Tk (common with Homebrew Python), the operating
+    system's own dialog is used instead. Returns ``(path, status)`` with
+    status ``selected``, ``cancelled`` or ``unavailable``; a headless machine
+    returns ``unavailable`` and the caller falls back to the in-page browser.
     """
     import subprocess
     import sys
@@ -183,14 +281,21 @@ def native_folder_dialog(initial_dir=None, prompt="Select the Himawari output fo
             [sys.executable, "-c", _TK_FOLDER_SCRIPT, str(initial) if initial else "", prompt],
             capture_output=True, text=True, timeout=600, **extra,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except subprocess.TimeoutExpired:
         return None, "unavailable"
+    except OSError:
+        return os_native_folder_dialog(initial, prompt)
 
     if result.returncode != 0:
-        return None, "unavailable"
+        # No Tk in this interpreter (or no display): use the OS dialog.
+        return os_native_folder_dialog(initial, prompt)
 
     chosen = (result.stdout or "").strip()
-    return (chosen or None), ("selected" if chosen else "cancelled")
+    if not chosen:
+        return None, "cancelled"
+    # str(Path(...)) renders the native separator: C:/Users/... -> C:\Users\...
+    # on Windows, and leaves POSIX paths unchanged on macOS.
+    return str(Path(chosen)), "selected"
 
 
 def make_analysis_docx(html):
@@ -424,7 +529,7 @@ def satellite_tab():
             return
         path, status = native_folder_dialog(candidate)
         if status == "selected" and path:
-            st.session_state["hima_output_dir_text"] = path
+            st.session_state["hima_output_dir_text"] = str(Path(path))
             st.session_state["hima_browser_open"] = False
         elif status == "unavailable":
             st.session_state["hima_native_unavailable"] = True
@@ -519,9 +624,10 @@ def satellite_tab():
                   use_container_width=True,
                   help="Opens the system folder chooser. If that is not available, "
                        "a folder browser opens inside this page.")
+        st.caption(f"Use this system's path format — example: `{Path.home() / 'Himawari_9'}`")
         if st.session_state.get("hima_native_unavailable"):
-            st.caption("The system folder dialog is unavailable because this Python has no Tk support. "
-                       "Use the folder browser below, or install `python-tk` for this Python.")
+            st.caption("The folder dialog could not be opened on this machine. "
+                       "Use the folder browser below to pick the download folder.")
         elif not st.session_state.get("hima_browser_open"):
             st.button("Browse folders in this page instead", key="hima_browse_inline",
                       on_click=_toggle_browser, type="tertiary")
