@@ -29,6 +29,16 @@ Open <http://localhost:8080>. Set `PORT` to use another port. For the OpenAI-com
 
 Uploads are processed in memory and sent to the configured model provider. Up to 100 MB per request and 12 files are accepted; at most four images (8 MB each) are forwarded. Use sanitized, non-sensitive test data. Large posts are still subject to memory limits of this simple development server.
 
+## Satellite workflow (Streamlit "Satellite Analyze" tab)
+
+The tab runs in three explicit steps:
+
+1. **Download the full disk** from JAXA P-Tree into a local folder. The full-disk NetCDF is kept on disk (roughly 600 MB per scene); only missing scenes are fetched again.
+2. **Crop** any saved full disk to a south/north/west/east box. The ROI copy is written next to the full disk as `..._ROI_<south>_<west>_<north>_<east>.nc`; the original file is left untouched, so a new box can be cropped later without re-downloading.
+3. **Analyse** the cropped scenes directly from that folder — no browser upload. Plotting, two-scene motion, and cooling use the crop's own extent, so boxes outside the Juanda area also work. The dense cloud-motion overlay is still drawn for Juanda.
+
+JAXA credentials are used for the FTP request only and are not written to disk.
+
 ## Standalone Rainbow `.vol` viewer
 
 For reliable direct display without the web API, run the `wradlib` viewer:
