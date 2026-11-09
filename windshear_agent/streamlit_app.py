@@ -291,13 +291,18 @@ def radar_tab():
 
 
 def satellite_tab():
-    from satellite_analysis import process_satellite_file, process_motion_files, process_convective_cooling_files
+    from satellite_analysis import (process_satellite_file, process_motion_files,
+                                    process_convective_cooling_files, JUANDA_REGION, CTV699_REGION)
     from dense_amv_ctv699 import process_uploaded_sequence
-    from himawari_download import download_himawari
+    from himawari_download import download_himawari, list_local_products, crop_saved_products
+
     st.subheader("Himawari satellite")
-    st.caption("Upload limit is 800 MB per file, set in `.streamlit/config.toml`. Full-disk R21 scenes are often ~600 MB, so prefer the regional ROI crops produced by the downloader below—they are much faster to upload and use far less memory.")
-    with st.expander("Download from JAXA P-Tree", expanded=False):
-        st.caption("Credentials are used for this request only. Files are written on the server, not downloaded to your browser.")
+    st.caption("Three steps: download the full disk to a local folder, crop it to your area of interest, then analyse the cropped scenes locally.")
+
+    # ---------------- Step 1: download the full disk ----------------
+    st.markdown("#### Step 1 · Download the full disk to a local folder")
+    with st.expander("JAXA P-Tree download", expanded=False):
+        st.caption("The full-disk NetCDF (about 600 MB per scene) is saved on this machine and kept. Credentials are used for this request only.")
         username = st.text_input("JAXA username", key="jaxa_user")
         password = st.text_input("JAXA password", type="password", key="jaxa_password")
         c1, c2 = st.columns(2)
@@ -306,55 +311,121 @@ def satellite_tab():
         end = c2.datetime_input("End time (UTC)", value=now_utc)
         c1, c2 = st.columns(2)
         interval = c1.selectbox("Interval (minutes)", [10, 20, 30, 60])
-        output_dir = c2.text_input("Server output folder", value="./Himawari_9")
-        c1, c2 = st.columns(2)
-        south = c1.number_input("South latitude", value=-8.15, format="%.4f")
-        north = c2.number_input("North latitude", value=-6.8, format="%.4f")
-        c1, c2 = st.columns(2)
-        west = c1.number_input("West longitude", value=112.1, format="%.4f")
-        east = c2.number_input("East longitude", value=113.25, format="%.4f")
-        if st.button("Download and crop scenes", key="download_hima"):
+        output_dir = c2.text_input("Local output folder", value="./Himawari_9", key="hima_output_dir")
+        if st.button("Download full disk", key="download_hima_full", type="primary"):
             progress = st.progress(0, text="Starting download…")
             try:
                 def update(p):
-                    progress.progress(min(100, int(p.get("percent", 0))), text=f"{p.get('stage', '')} · {p.get('current_time', '')}")
-                result = download_himawari(username, password, start.strftime("%Y%m%d%H%M"), end.strftime("%Y%m%d%H%M"), [[south, west], [south, east], [north, east], [north, west]], output_dir, interval, update)
-                st.success(f"Saved {len(result['cropped_downloaded'])} cropped scene(s) to {result['output_dir']}")
-                archive = zip_cropped_scenes(result)
-                if archive:
-                    st.session_state["hima_cropped_zip"] = archive
-                    st.session_state["hima_cropped_zip_name"] = f"himawari_roi_{start:%Y%m%d_%H%M}_{end:%Y%m%d_%H%M}.zip"
-                    st.session_state["hima_cropped_zip_count"] = len(result.get("cropped_downloaded", [])) + len(result.get("already_existing", []))
-                else:
-                    st.session_state.pop("hima_cropped_zip", None)
-                    st.warning("No cropped scene files were available to package for download.")
-                st.json({k: v for k, v in result.items() if k not in ("full_disk_files",)})
+                    progress.progress(min(100, int(p.get("percent", 0))),
+                                      text=f"{p.get('stage', '')} · {p.get('current_time', '')}")
+                result = download_himawari(username, password,
+                                           start.strftime("%Y%m%d%H%M"), end.strftime("%Y%m%d%H%M"),
+                                           None, output_dir, interval, update, crop=False)
+                st.success(f"Saved {len(result['full_disk_downloaded'])} new full-disk scene(s) to {result['output_dir']}")
+                st.caption("Full-disk files stay on disk. Crop them in Step 2.")
+                if result["not_found"]:
+                    with st.expander(f"Not available at JAXA ({len(result['not_found'])})"):
+                        st.dataframe(pd.DataFrame(result["not_found"]), use_container_width=True, hide_index=True)
+                if result["failed"]:
+                    st.warning(f"{len(result['failed'])} download(s) failed.")
+                    with st.expander("Failure detail"):
+                        st.dataframe(pd.DataFrame(result["failed"]), use_container_width=True, hide_index=True)
             except Exception as exc:
                 st.error(f"Download failed: {exc}")
-            finally:
-                # Streamlit widget values live only for this browser session;
-                # avoid logging or persisting submitted credentials elsewhere.
-                pass
-    if "hima_cropped_zip" in st.session_state:
-        st.download_button(
-            f"Download {st.session_state['hima_cropped_zip_count']} cropped scene(s) (.zip)",
-            data=st.session_state["hima_cropped_zip"],
-            file_name=st.session_state["hima_cropped_zip_name"],
-            mime="application/zip",
-            key="download_hima_zip",
-            help="Downloads the regional cropped NetCDF scenes as one ZIP file.",
-        )
 
-    st.markdown("#### Plot one NetCDF field")
-    single = st.file_uploader("Himawari NetCDF (.nc/.nc4/.cdf)", type=NC_TYPES, key="sat_single", max_upload_size=800)
-    variable = st.text_input("Variable name (optional; auto-select Band 13 where available)")
-    if st.button("Plot satellite field", key="plot_sat"):
+    # ---------------- Step 2: crop to a lat/lon box ----------------
+    st.markdown("#### Step 2 · Crop a saved full disk to a latitude/longitude box")
+    inventory = list_local_products(output_dir)
+    full_disk = inventory["full_disk"]
+    if not inventory["exists"]:
+        st.info(f"Folder not found yet: {inventory['root']}")
+    elif not full_disk:
+        st.info(f"No full-disk scenes in {inventory['root']} yet. Download them in Step 1.")
+    else:
+        full_bytes = sum(item["size_bytes"] for item in full_disk)
+        st.caption(f"{len(full_disk)} full-disk scene(s) · {full_bytes / 1e9:.2f} GB in {inventory['root']}")
+        chosen = st.multiselect("Full-disk scene(s) to crop", [item["name"] for item in full_disk],
+                                default=[full_disk[-1]["name"]], key="hima_crop_sources")
+        c1, c2 = st.columns(2)
+        south = c1.number_input("South latitude", value=-8.15, format="%.4f", key="hima_crop_south")
+        north = c2.number_input("North latitude", value=-6.80, format="%.4f", key="hima_crop_north")
+        c1, c2 = st.columns(2)
+        west = c1.number_input("West longitude", value=112.10, format="%.4f", key="hima_crop_west")
+        east = c2.number_input("East longitude", value=113.25, format="%.4f", key="hima_crop_east")
+        st.caption("The ROI copy is written next to the full disk; the original file is not modified.")
+        if st.button("Crop selected scene(s)", key="crop_hima"):
+            try:
+                outcomes = crop_saved_products(output_dir, chosen, south, north, west, east)
+                created = [o for o in outcomes if o["status"] == "cropped"]
+                already = [o for o in outcomes if o["status"] == "already_exists"]
+                failed = [o for o in outcomes if o["status"] == "failed"]
+                if created:
+                    st.success(f"Cropped {len(created)} scene(s) to {south}–{north}°N, {west}–{east}°E.")
+                if already:
+                    st.info(f"{len(already)} crop(s) already existed and were left unchanged.")
+                if failed:
+                    st.error(f"{len(failed)} crop(s) failed.")
+                if outcomes:
+                    st.dataframe(pd.DataFrame(outcomes), use_container_width=True, hide_index=True)
+            except Exception as exc:
+                st.error(f"Cropping failed: {exc}")
+
+    roi = list_local_products(output_dir)["roi"]
+    if roi:
+        st.caption(f"{len(roi)} cropped scene(s) ready for analysis.")
+        st.dataframe(pd.DataFrame([{
+            "file": item["name"],
+            "size_MB": round(item["size_bytes"] / 1e6, 1),
+            "south": (item.get("bounds") or {}).get("south"),
+            "north": (item.get("bounds") or {}).get("north"),
+            "west": (item.get("bounds") or {}).get("west"),
+            "east": (item.get("bounds") or {}).get("east"),
+            "modified": item["modified"],
+        } for item in roi]), use_container_width=True, hide_index=True)
+        archive = zip_cropped_scenes({"output_dir": output_dir, "cropped_downloaded": [],
+                                      "already_existing": [item["name"] for item in roi]})
+        if archive:
+            st.download_button(f"Download all {len(roi)} cropped scene(s) (.zip)", data=archive,
+                               file_name="himawari_roi.zip", mime="application/zip", key="download_hima_zip")
+
+    # ---------------- Step 3: analyse the crops ----------------
+    st.markdown("#### Step 3 · Analyse the cropped scenes")
+    root = Path(output_dir).expanduser().resolve()
+    roi_names = [item["name"] for item in roi]
+    use_local = st.toggle("Read scenes from the local output folder (no upload)", value=bool(roi_names),
+                          key="sat_use_local",
+                          help="Uses the cropped ROI files from Step 2. Turn off to analyse a file uploaded from the browser instead.")
+    if use_local and not roi_names:
+        st.info("No cropped scenes yet. Crop a full disk in Step 2, or turn this toggle off to upload a file.")
+    region = None if use_local else JUANDA_REGION
+
+    def read_local(name):
+        return (name, (root / name).read_bytes())
+
+    def pick_many(label, key):
+        if use_local:
+            names = st.multiselect(label, roi_names, key=f"{key}_local")
+            return [read_local(name) for name in names]
+        files = st.file_uploader(label, type=NC_TYPES, accept_multiple_files=True, key=key, max_upload_size=800)
+        return uploaded_pairs(files or [])
+
+    def pick_one(label, key):
+        if use_local:
+            name = st.selectbox(label, [""] + roi_names, key=f"{key}_local")
+            return read_local(name) if name else None
+        uploaded = st.file_uploader(label, type=NC_TYPES, key=key, max_upload_size=800)
+        return (uploaded.name, uploaded.getvalue()) if uploaded else None
+
+    st.markdown("##### Plot one band")
+    single = pick_one("Scene", "sat_single")
+    variable = st.text_input("Variable name (optional; auto-selects Band 13)", key="sat_variable")
+    if st.button("Plot field", key="plot_sat"):
         if not single:
-            st.error("Choose a NetCDF file first.")
+            st.error("Choose a scene first.")
         else:
             try:
-                with st.spinner("Reading and plotting Juanda-area field…"):
-                    out = process_satellite_file(single.name, single.getvalue(), variable)
+                with st.spinner("Reading and plotting the field…"):
+                    out = process_satellite_file(single[0], single[1], variable, region=region)
                 st.session_state["comprehensive_satellite_field"] = {
                     "file": out.get("filename"), "variable": out.get("variable"),
                     "long_name": out.get("long_name"), "units": out.get("units"),
@@ -365,23 +436,24 @@ def satellite_tab():
                 show_b64_image(out["preview"]["png_base64"])
                 st.json(out["statistics"])
                 st.warning(out["caveat"])
-                st.session_state["sat_variables"] = out["available_variables"]
             except Exception as exc:
                 st.error(f"Satellite plotting failed: {exc}")
 
-    st.markdown("#### Two-scene feature-motion approximation")
+    st.markdown("##### Two-scene feature-motion approximation")
     c1, c2 = st.columns(2)
-    earlier = c1.file_uploader("Earlier scene", type=NC_TYPES, key="motion_1", max_upload_size=800)
-    later = c2.file_uploader("Later scene (10 minutes after)", type=NC_TYPES, key="motion_2", max_upload_size=800)
+    with c1:
+        earlier = pick_one("Earlier scene", "motion_1")
+    with c2:
+        later = pick_one("Later scene (10 minutes after)", "motion_2")
     if st.button("Estimate motion for Bands 3, 7 and 13", key="run_motion"):
         if not earlier or not later:
             st.error("Choose both scenes.")
         else:
             try:
                 with st.spinner("Tracking image features…"):
-                    result = process_motion_files(uploaded_pairs([earlier, later]))
+                    result = process_motion_files([earlier, later], region=region)
                 st.session_state["comprehensive_satellite_motion"] = {
-                    "files": [earlier.name, later.name],
+                    "files": [earlier[0], later[0]],
                     "bands": [{k: v for k, v in band.items() if k not in ("preview",)} for band in result.get("bands", [])],
                     "caveat": result.get("caveat", ""),
                 }
@@ -394,16 +466,18 @@ def satellite_tab():
             except Exception as exc:
                 st.error(f"Motion estimate failed: {exc}")
 
-    st.markdown("#### Dense cloud-motion vectors")
-    dense = st.file_uploader("Select at least 3 consecutive scenes, exactly 10 minutes apart", type=NC_TYPES, accept_multiple_files=True, key="dense_files", max_upload_size=800)
+    st.markdown("##### Dense cloud-motion vectors")
+    st.caption("Map overlays in this product are drawn for the Juanda area; they are not re-georeferenced for other crop boxes.")
+    dense = pick_many("Select at least 3 consecutive scenes, exactly 10 minutes apart", "dense_files")
     if st.button("Process dense motion sequence", key="run_dense"):
-        if len(dense or []) < 3: st.error("Select at least three scenes.")
+        if len(dense) < 3:
+            st.error("Select at least three scenes.")
         else:
             try:
                 with st.spinner("Calculating dense cloud motion…"):
-                    result = process_uploaded_sequence(uploaded_pairs(dense))
+                    result = process_uploaded_sequence(dense)
                 st.session_state["comprehensive_satellite_dense"] = {
-                    "files": [f.name for f in dense], "scenes": result.get("scenes"),
+                    "files": [f[0] for f in dense], "scenes": result.get("scenes"),
                     "products": [{k: v for k, v in product.items() if not k.endswith("base64")} for product in result.get("products", [])],
                     "caveat": result.get("caveat", ""),
                 }
@@ -412,18 +486,20 @@ def satellite_tab():
                     st.markdown(f"**{product['time_utc']} · {product['valid_vectors']} valid vectors · {product['good_vectors']} good**")
                     for key in ("speed_png_base64", "direction_png_base64", "qc_png_base64"):
                         show_b64_image(product[key], key.replace("_png_base64", "").replace("_", " "))
-            except Exception as exc: st.error(f"Dense motion failed: {exc}")
+            except Exception as exc:
+                st.error(f"Dense motion failed: {exc}")
 
-    st.markdown("#### Convective cooling / cold-cloud evolution")
-    cooling_files = st.file_uploader("Select 2–15 scenes with matching coverage", type=NC_TYPES, accept_multiple_files=True, key="cooling_files", max_upload_size=800)
+    st.markdown("##### Convective cooling / cold-cloud evolution")
+    cooling_files = pick_many("Select 2–15 scenes with matching coverage", "cooling_files")
     if st.button("Process cooling sequence", key="run_cooling"):
-        if len(cooling_files or []) < 2: st.error("Select at least two scenes.")
+        if len(cooling_files) < 2:
+            st.error("Select at least two scenes.")
         else:
             try:
                 with st.spinner("Calculating Band 13 diagnostics…"):
-                    result = process_convective_cooling_files(uploaded_pairs(cooling_files))
+                    result = process_convective_cooling_files(cooling_files, region=None if use_local else CTV699_REGION)
                 st.session_state["comprehensive_satellite_cooling"] = {
-                    "files": [f.name for f in cooling_files],
+                    "files": [f[0] for f in cooling_files],
                     "statistics": result.get("statistics", []),
                     "cold_core_centroids": result.get("cold_core_centroids", []),
                     "caveat": result.get("caveat", ""),
@@ -433,7 +509,8 @@ def satellite_tab():
                 st.dataframe(pd.DataFrame(result["statistics"]), use_container_width=True)
                 st.dataframe(pd.DataFrame(result["cold_core_centroids"]), use_container_width=True)
                 st.warning(result["caveat"])
-            except Exception as exc: st.error(f"Cooling analysis failed: {exc}")
+            except Exception as exc:
+                st.error(f"Cooling analysis failed: {exc}")
 
 
 def sounding_panel(prefix):
