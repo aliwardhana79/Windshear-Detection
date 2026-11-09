@@ -14,19 +14,40 @@ from netCDF4 import Dataset
 from view_rainbow_vol import add_map_context
 
 JUANDA_REGION = (112.1, 113.25, -8.15, -6.8)
+CTV699_REGION = (112.0, 113.5, -8.0, -6.5)
 
 
-def process_satellite_file(filename: str, content: bytes, variable: str = ""):
-    """Crop a Himawari equal lat/lon NetCDF to the Juanda map and plot a field."""
+def _region_indices(lat, lon, region):
+    """Return index arrays for a (west, east, south, north) box.
+
+    ``region=None`` keeps the file's full extent, which is what local ROI
+    crops need: they are already limited to the requested airport area.
+    """
+    if region is None:
+        return np.arange(lat.size), np.arange(lon.size)
+    west, east, south, north = region
+    y = np.flatnonzero((lat >= south) & (lat <= north))
+    x = np.flatnonzero((lon >= west) & (lon <= east))
+    if not y.size or not x.size:
+        raise ValueError(
+            f"File does not cover the requested area ({west}–{east}°E, {south}–{north}°N)."
+        )
+    return y, x
+
+
+def _overlaps_juanda(lon, lat):
+    return (float(np.max(lon)) >= JUANDA_REGION[0] and float(np.min(lon)) <= JUANDA_REGION[1]
+            and float(np.max(lat)) >= JUANDA_REGION[2] and float(np.min(lat)) <= JUANDA_REGION[3])
+
+
+def process_satellite_file(filename: str, content: bytes, variable: str = "", region=JUANDA_REGION):
+    """Crop a Himawari equal lat/lon NetCDF to a region and plot a field."""
     with Dataset("satellite-upload.nc", mode="r", memory=content) as dataset:
         if "latitude" not in dataset.variables or "longitude" not in dataset.variables:
             raise ValueError("Expected one-dimensional latitude and longitude coordinate variables.")
         latitude = np.asarray(dataset.variables["latitude"][:], dtype=float)
         longitude = np.asarray(dataset.variables["longitude"][:], dtype=float)
-        lat_indices = np.flatnonzero((latitude >= -8.15) & (latitude <= -6.8))
-        lon_indices = np.flatnonzero((longitude >= 112.1) & (longitude <= 113.25))
-        if not lat_indices.size or not lon_indices.size:
-            raise ValueError("The file does not cover the Juanda map area (112.1–113.25°E, 6.8–8.15°S).")
+        lat_indices, lon_indices = _region_indices(latitude, longitude, region)
 
         candidates = []
         for name, item in dataset.variables.items():
@@ -64,7 +85,7 @@ def process_satellite_file(filename: str, content: bytes, variable: str = ""):
 
     valid = np.isfinite(field)
     if not valid.any():
-        raise ValueError(f"Field {variable} has no valid pixels in the Juanda crop.")
+        raise ValueError(f"Field {variable} has no valid pixels in the selected area.")
     lo, hi = np.percentile(field[valid], [2, 98])
     if lo == hi:
         lo, hi = float(np.min(field[valid])), float(np.max(field[valid]) + 1)
@@ -77,7 +98,8 @@ def process_satellite_file(filename: str, content: bytes, variable: str = ""):
     fig.subplots_adjust(left=0.12, right=0.86, bottom=0.12, top=0.88)
     mesh = ax.pcolormesh(lon, lat, field, shading="auto", cmap="turbo", vmin=lo, vmax=hi,
                          rasterized=True, zorder=3)
-    add_map_context(ax)
+    if _overlaps_juanda(lon, lat):
+        add_map_context(ax)
     ax.set_xlabel("Longitude (°E)")
     ax.set_ylabel("Latitude (°; negative = °S)")
     ax.set_title(f"{Path(filename).name} · {variable} · {long_name}")
@@ -109,10 +131,10 @@ def process_satellite_file(filename: str, content: bytes, variable: str = ""):
     }
 
 
-def process_motion_files(files, band="all"):
+def process_motion_files(files, band="all", region=JUANDA_REGION):
     """Process the same two scenes for Bands 3, 7, and 13 automatically."""
     bands = ("03", "07", "13") if str(band).lower() in ("all", "auto", "") else (str(band).zfill(2),)
-    products = [_process_motion_band(files, selected_band) for selected_band in bands]
+    products = [_process_motion_band(files, selected_band, region) for selected_band in bands]
     return {
         "bands": products,
         "files": products[0]["files"],
@@ -121,7 +143,7 @@ def process_motion_files(files, band="all"):
     }
 
 
-def process_convective_cooling_files(files):
+def process_convective_cooling_files(files, region=CTV699_REGION):
     """Summarize Band-13 cooling, cold-cloud areas, and core-centroid evolution."""
     from scipy.ndimage import uniform_filter
     if len(files) < 2:
@@ -136,9 +158,7 @@ def process_convective_cooling_files(files):
                 raise ValueError(f"{Path(filename).name} has no Band 13 field (tbb_13).")
             lat=np.asarray(ds.variables["latitude"][:],dtype=float)
             lon=np.asarray(ds.variables["longitude"][:],dtype=float)
-            y=np.flatnonzero((lat>=-8.0)&(lat<=-6.5));x=np.flatnonzero((lon>=112.0)&(lon<=113.5))
-            if not y.size or not x.size:
-                raise ValueError(f"{Path(filename).name} does not cover the CTV699/Juanda area (112–113.5°E, 8–6.5°S).")
+            y,x=_region_indices(lat,lon,region)
             var=ds.variables["tbb_13"]
             iy,ix=var.dimensions.index("latitude"),var.dimensions.index("longitude")
             selection=[slice(None),slice(None)];selection[iy]=slice(int(y[0]),int(y[-1])+1);selection[ix]=slice(int(x[0]),int(x[-1])+1)
@@ -156,6 +176,11 @@ def process_convective_cooling_files(files):
         if scene["tbb"].shape!=ref["tbb"].shape or not np.allclose(scene["lat"],ref["lat"]) or not np.allclose(scene["lon"],ref["lon"]):
             raise ValueError("All selected scenes must share the same latitude/longitude grid and regional coverage.")
     lat,lon=ref["lat"],ref["lon"]
+    # Reference cross: the selected box centre, or the file centre for a local ROI crop.
+    if region is None:
+        centre_lon=0.5*(float(np.min(lon))+float(np.max(lon)));centre_lat=0.5*(float(np.min(lat))+float(np.max(lat)))
+    else:
+        centre_lon=0.5*(region[0]+region[1]);centre_lat=0.5*(region[2]+region[3])
     dlat=abs(float(np.median(np.diff(lat))));dlon=abs(float(np.median(np.diff(lon))))
     pixel_area=(111.32*dlat)*(111.32*np.cos(np.deg2rad(lat))*dlon)[:,None]
     stats=[];centroids=[];smoothed=[]
@@ -199,7 +224,7 @@ def process_convective_cooling_files(files):
     mesh=None
     for ax,item in zip(axes.flat,cooling):
         mesh=ax.pcolormesh(lon,lat,item["rate"],cmap="RdBu_r",norm=TwoSlopeNorm(vmin=-vmax,vcenter=0,vmax=vmax),shading="auto")
-        ax.set_title(item["interval"]);ax.set_xlabel("Longitude (°E)");ax.set_ylabel("Latitude (°; negative = °S)");ax.scatter([112.7873],[-7.38],marker="x",c="black")
+        ax.set_title(item["interval"]);ax.set_xlabel("Longitude (°E)");ax.set_ylabel("Latitude (°; negative = °S)");ax.scatter([centre_lon],[centre_lat],marker="x",c="black")
     for ax in list(axes.flat)[len(cooling):]:ax.remove()
     fig.colorbar(mesh,ax=list(axes.flat)[:len(cooling)],label="Smoothed apparent TBB change rate (K/hour); negative = cooling",shrink=.85)
     cooling_png=_figure_base64(fig);plt.close(fig)
@@ -214,7 +239,7 @@ def _figure_base64(fig):
     return base64.b64encode(output.getvalue()).decode("ascii")
 
 
-def _process_motion_band(files, band="13"):
+def _process_motion_band(files, band="13", region=JUANDA_REGION):
     """Estimate cloud-pattern displacement between sequential Himawari fields.
 
     Uses local normalized cross-correlation. The result is image feature motion,
@@ -234,10 +259,7 @@ def _process_motion_band(files, band="13"):
                 raise ValueError(f"{filename} has no {variable} field for Band {int(band)}.")
             lat = np.asarray(ds.variables["latitude"][:], dtype=float)
             lon = np.asarray(ds.variables["longitude"][:], dtype=float)
-            x = np.flatnonzero((lon >= JUANDA_REGION[0]) & (lon <= JUANDA_REGION[1]))
-            y = np.flatnonzero((lat >= JUANDA_REGION[2]) & (lat <= JUANDA_REGION[3]))
-            if not x.size or not y.size:
-                raise ValueError(f"{filename} does not cover Juanda region.")
+            y, x = _region_indices(lat, lon, region)
             var = ds.variables[variable]
             iy, ix = var.dimensions.index("latitude"), var.dimensions.index("longitude")
             sl = [slice(None), slice(None)]
@@ -321,7 +343,7 @@ def _process_motion_band(files, band="13"):
         matched.append((cy, cx, dx, dy, peak, forward_backward_error,
                         peak >= 0.75 and forward_backward_error <= 2.0))
     if not matched:
-        raise ValueError("No moving features matched in the Juanda crop. Try another band or a wider time separation.")
+        raise ValueError("No moving features matched in the selected area. Try another band or a wider time separation.")
 
     # Grid coordinates in regular Himawari lat/lon data. Eastward longitude
     # speed is corrected by cos(latitude) for local physical distance.
