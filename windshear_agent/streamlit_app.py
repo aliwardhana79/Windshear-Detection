@@ -299,6 +299,76 @@ def satellite_tab():
     st.subheader("Himawari satellite")
     st.caption("Three steps: download the full disk to a local folder, crop it to your area of interest, then analyse the cropped scenes locally.")
 
+    default_output_dir = str(Path("./Himawari_9").resolve())
+    if "hima_output_dir_text" not in st.session_state:
+        st.session_state["hima_output_dir_text"] = default_output_dir
+
+    def _toggle_browser():
+        opening = not st.session_state.get("hima_browser_open", False)
+        st.session_state["hima_browser_open"] = opening
+        if opening:
+            candidate = Path(st.session_state.get("hima_output_dir_text", "")).expanduser()
+            st.session_state["hima_browse_path"] = str(candidate if candidate.is_dir() else Path.home())
+
+    def _use_folder(path):
+        st.session_state["hima_output_dir_text"] = path
+        st.session_state["hima_browser_open"] = False
+
+    def _go(path):
+        st.session_state["hima_browse_path"] = str(path)
+
+    def _create_folder(parent):
+        name = (st.session_state.get("hima_new_folder") or "").strip()
+        if not name:
+            st.session_state["hima_folder_error"] = "Enter a folder name first."
+            return
+        target = Path(parent) / name
+        try:
+            target.mkdir(parents=True, exist_ok=False)
+            st.session_state["hima_browse_path"] = str(target)
+            st.session_state["hima_new_folder"] = ""
+            st.session_state["hima_folder_error"] = ""
+        except Exception as exc:
+            st.session_state["hima_folder_error"] = str(exc)
+
+    def _render_folder_browser():
+        current = Path(st.session_state.get("hima_browse_path") or Path.home()).expanduser()
+        if not current.is_dir():
+            current = Path.home()
+        st.session_state["hima_browse_path"] = str(current)
+        st.caption(f"Current folder: `{current}`")
+        nav = st.columns([1, 1, 4])
+        nav[0].button("\u2191 Parent", key="hima_dir_up", on_click=_go,
+                      args=(str(current.parent),), use_container_width=True)
+        nav[1].button("Home", key="hima_dir_home", on_click=_go,
+                      args=(str(Path.home()),), use_container_width=True)
+        try:
+            subdirs = sorted((p for p in current.iterdir() if p.is_dir() and not p.name.startswith(".")),
+                             key=lambda p: p.name.lower())
+        except OSError as exc:
+            st.warning(f"Cannot list this folder: {exc}")
+            subdirs = []
+        if not subdirs:
+            st.caption("No subfolders here. Type a new folder name below, or use this folder.")
+        else:
+            cols = st.columns(3)
+            for index, folder in enumerate(subdirs[:30]):
+                cols[index % 3].button(f"\U0001F4C1 {folder.name}",
+                                       key=f"hima_dir_{abs(hash(str(folder)))}",
+                                       on_click=_go, args=(str(folder),),
+                                       use_container_width=True)
+            if len(subdirs) > 30:
+                st.caption(f"Showing 30 of {len(subdirs)} folders.")
+        new_col, make_col = st.columns([3, 1], vertical_alignment="bottom")
+        new_col.text_input("New folder name", key="hima_new_folder",
+                           placeholder="e.g. Himawari_CGK")
+        make_col.button("Create", key="hima_make_folder", on_click=_create_folder,
+                        args=(str(current),), use_container_width=True)
+        if st.session_state.get("hima_folder_error"):
+            st.error(st.session_state["hima_folder_error"])
+        st.button(f"Use this folder: {current}", key="hima_use_folder", type="primary",
+                  on_click=_use_folder, args=(str(current),))
+
     # ---------------- Step 1: download the full disk ----------------
     st.markdown("#### Step 1 · Download the full disk to a local folder")
     with st.expander("JAXA P-Tree download", expanded=False):
@@ -309,9 +379,15 @@ def satellite_tab():
         now_utc = datetime.now(timezone.utc).replace(tzinfo=None, second=0, microsecond=0)
         start = c1.datetime_input("Start time (UTC)", value=now_utc)
         end = c2.datetime_input("End time (UTC)", value=now_utc)
-        c1, c2 = st.columns(2)
-        interval = c1.selectbox("Interval (minutes)", [10, 20, 30, 60])
-        output_dir = c2.text_input("Local output folder", value="./Himawari_9", key="hima_output_dir")
+        interval = st.selectbox("Interval (minutes)", [10, 20, 30, 60])
+        c1, c2 = st.columns([4, 1], vertical_alignment="bottom")
+        output_dir = c1.text_input("Local output folder (type a path or browse)",
+                                   key="hima_output_dir_text")
+        c2.button("Browse\u2026", key="hima_browse_btn", on_click=_toggle_browser,
+                  use_container_width=True)
+        if st.session_state.get("hima_browser_open"):
+            with st.container(border=True):
+                _render_folder_browser()
         if st.button("Download full disk", key="download_hima_full", type="primary"):
             progress = st.progress(0, text="Starting download…")
             try:
