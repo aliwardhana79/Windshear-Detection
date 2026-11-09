@@ -33,7 +33,7 @@ Uploads are processed in memory and sent to the configured model provider. Up to
 
 The tab runs in three explicit steps:
 
-1. **Download the full disk** from JAXA P-Tree into a local folder. The full-disk NetCDF is kept on disk (roughly 600 MB per scene); only missing scenes are fetched again.
+1. **Download the full disk** from JAXA P-Tree into a local folder. Type the path directly or use **Browse…** to navigate the folders on this machine, create a new folder, and select it. The full-disk NetCDF is kept on disk (roughly 600 MB per scene); only missing scenes are fetched again.
 2. **Crop** any saved full disk to a south/north/west/east box. The ROI copy is written next to the full disk as `..._ROI_<south>_<west>_<north>_<east>.nc`; the original file is left untouched, so a new box can be cropped later without re-downloading.
 3. **Analyse** the cropped scenes directly from that folder — no browser upload. Plotting, two-scene motion, and cooling use the crop's own extent, so boxes outside the Juanda area also work. The dense cloud-motion overlay is still drawn for Juanda.
 
