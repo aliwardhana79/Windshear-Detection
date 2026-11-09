@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from ftplib import FTP
 from pathlib import Path
+import os
 import re
 
 import numpy as np
@@ -49,8 +50,19 @@ def download_himawari(username, password, start, end, corners=None, output_dir="
     if (end_dt - start_dt).total_seconds() / 60 > 24 * 60:
         raise ValueError("A single download request is limited to 24 hours.")
 
-    output = Path(output_dir).expanduser().resolve()
-    output.mkdir(parents=True, exist_ok=True)
+    output = Path(output_dir).expanduser()
+    try:
+        output.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ValueError(
+            f"Output folder is not usable: {exc}. Choose a folder you can write to, "
+            "for example your home folder or Downloads."
+        ) from exc
+    if not output.is_dir():
+        raise ValueError(f"Output path is not a folder: {output}")
+    if not os.access(output, os.W_OK):
+        raise ValueError(f"Output folder is not writable: {output}")
+    output = output.resolve()
     stamps = []
     current = start_dt
     while current <= end_dt:
