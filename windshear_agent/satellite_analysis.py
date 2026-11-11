@@ -40,9 +40,27 @@ def _overlaps_juanda(lon, lat):
             and float(np.max(lat)) >= JUANDA_REGION[2] and float(np.min(lat)) <= JUANDA_REGION[3])
 
 
-def process_satellite_file(filename: str, content: bytes, variable: str = "", region=JUANDA_REGION):
-    """Crop a Himawari equal lat/lon NetCDF to a region and plot a field."""
-    with Dataset("satellite-upload.nc", mode="r", memory=content) as dataset:
+def _open_dataset(filename, content):
+    """Open an uploaded NetCDF held in memory, or one already saved to disk.
+
+    Passing a ``Path`` lets netCDF4 read only the requested slice instead of
+    loading a ~600 MB full-disk scene into RAM.
+    """
+    if isinstance(content, (bytes, bytearray, memoryview)):
+        return Dataset("satellite-upload.nc", mode="r", memory=bytes(content))
+    path = Path(content)
+    if not path.is_file():
+        raise FileNotFoundError(f"Scene file not found: {path}")
+    return Dataset(str(path), mode="r")
+
+
+def process_satellite_file(filename: str, content, variable: str = "", region=JUANDA_REGION):
+    """Crop a Himawari equal lat/lon NetCDF to a region and plot a field.
+
+    ``content`` is either the uploaded file bytes or a ``Path`` to a scene in
+    the local output folder.
+    """
+    with _open_dataset(filename, content) as dataset:
         if "latitude" not in dataset.variables or "longitude" not in dataset.variables:
             raise ValueError("Expected one-dimensional latitude and longitude coordinate variables.")
         latitude = np.asarray(dataset.variables["latitude"][:], dtype=float)
@@ -153,7 +171,7 @@ def process_convective_cooling_files(files, region=CTV699_REGION):
         timestamp=_filename_time(filename)
         if timestamp is None:
             raise ValueError(f"Could not read observation time from {Path(filename).name}.")
-        with Dataset(Path(filename).name,mode="r",memory=content) as ds:
+        with _open_dataset(filename, content) as ds:
             if "tbb_13" not in ds.variables:
                 raise ValueError(f"{Path(filename).name} has no Band 13 field (tbb_13).")
             lat=np.asarray(ds.variables["latitude"][:],dtype=float)
@@ -254,7 +272,7 @@ def _process_motion_band(files, band="13", region=JUANDA_REGION):
 
     frames = []
     for filename, content in files:
-        with Dataset(filename, mode="r", memory=content) as ds:
+        with _open_dataset(filename, content) as ds:
             if variable not in ds.variables:
                 raise ValueError(f"{filename} has no {variable} field for Band {int(band)}.")
             lat = np.asarray(ds.variables["latitude"][:], dtype=float)
