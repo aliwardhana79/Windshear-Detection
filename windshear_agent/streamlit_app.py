@@ -6,6 +6,7 @@ import io
 import json
 import csv
 import os
+import shutil
 import sys
 import tempfile
 from datetime import date, datetime, timezone
@@ -196,8 +197,21 @@ def hosted_deployment_note():
         return ("This app is running on Streamlit Community Cloud, so downloaded scenes are "
                 "saved on the **server**, not on your own computer, and they disappear when the "
                 "app restarts. To save into a folder on your Mac or Windows PC, run the app on "
-                "that computer: `streamlit run streamlit_app.py`.")
+                "that computer: `streamlit run streamlit_app.py`. To analyse a full disk here, "
+                "split it with `split_for_upload.py` (or `split_for_upload.bat` on Windows) and "
+                "use **Upload a full disk in parts** in Step 2.")
     return None
+
+
+def free_disk_space(path):
+    """Return free bytes for the nearest existing folder, or ``None``."""
+    candidate = Path(path).expanduser()
+    while not candidate.exists() and candidate.parent != candidate:
+        candidate = candidate.parent
+    try:
+        return shutil.disk_usage(candidate).free
+    except OSError:
+        return None
 
 
 _TK_FOLDER_SCRIPT = r'''
@@ -555,6 +569,8 @@ def satellite_tab():
                                     process_convective_cooling_files, JUANDA_REGION, CTV699_REGION)
     from dense_amv_ctv699 import process_uploaded_sequence
     from himawari_download import download_himawari, list_local_products
+    from scene_parts import (MANIFEST_NAME, assemble, load_manifest, parse_manifest,
+                             parts_status, save_manifest, save_part, validate_netcdf)
 
     st.subheader("Himawari satellite")
     st.caption("Two steps: download the full disk to a local folder, then analyse scenes from that folder or an uploaded file.")
@@ -786,7 +802,15 @@ def satellite_tab():
     else:
         st.caption(f"{len(inventory['full_disk'])} full-disk and {len(inventory['roi'])} cropped scene(s) in {inventory['root']}")
 
-    use_local = st.toggle("Read scenes from the local output folder (no upload)", value=bool(local_names),
+    # After a parts upload is assembled, switch the toggle on before the widget
+    # is created so the new local scene is selected in the next run.
+    if "sat_use_local" not in st.session_state:
+        st.session_state["sat_use_local"] = bool(local_names)
+    if st.session_state.get("parts_just_assembled"):
+        st.session_state["parts_just_assembled"] = False
+        st.session_state["sat_use_local"] = True
+
+    use_local = st.toggle("Read scenes from the local output folder (no upload)",
                           key="sat_use_local",
                           help="Reads scenes saved in Step 1 and any ROI crops already on disk. "
                                "Turn off to analyse a file uploaded from the browser instead.")
@@ -794,8 +818,9 @@ def satellite_tab():
         st.info("No local scenes yet. Download in Step 1, or turn this toggle off to upload a file.")
     elif not use_local:
         st.caption("Browser uploads accept up to **1 GB per scene** (a full-disk R21 file is ~600 MB). "
-                   "Processing a scene that large needs several GB of free RAM; scenes already in the "
-                   "local folder are read directly without uploading.")
+                   "If one large upload fails with a 500 error, use **Upload a full disk in parts** "
+                   "below — the scene is split on your computer and reassembled here. Scenes in the "
+                   "local folder are read from disk without uploading.")
 
     def is_roi(name):
         return "_ROI_" in Path(name).name
@@ -806,7 +831,9 @@ def satellite_tab():
         return None if is_roi(name) else JUANDA_REGION
 
     def read_local(name):
-        return (name, (root / name).read_bytes())
+        # Hand the Path to the analysis code so netCDF4 reads only the Juanda
+        # slice; reading a ~600 MB full disk into memory would fail on Cloud.
+        return (name, root / name)
 
     def pick_many(label, key):
         if use_local:
@@ -823,6 +850,93 @@ def satellite_tab():
         uploaded = st.file_uploader(label, type=NC_TYPES, key=key,
                                     max_upload_size=MAX_SCENE_UPLOAD_MB)
         return (uploaded.name, uploaded.getvalue()) if uploaded else None
+
+    # ---------------- Large scene upload in parts ----------------
+    with st.expander("Large scene · upload a full disk in parts", expanded=False):
+        st.caption(
+            "Community Cloud rejects a single ~600 MB upload. Split the scene on your computer "
+            "with `split_for_upload.py` (or drag it onto `split_for_upload.bat` on Windows), then "
+            "upload `manifest.json` and each `.part` file here, one at a time. Parts are "
+            "checksummed, joined on the server, and analysed from disk."
+        )
+        free = free_disk_space(root)
+        if free is not None:
+            st.caption(f"Temporary disk in `{root}`: **{free / 1e9:.1f} GB free**. "
+                       "A 600 MB scene needs about 0.8 GB while assembling.")
+        upload_dir = Path(tempfile.gettempdir()) / "windshear_upload_parts"
+        st.caption(f"Incoming parts are held in `{upload_dir}` until assembly.")
+        manifest_round = int(st.session_state.get("parts_manifest_round", 0))
+        manifest_file = st.file_uploader(
+            "1 · Upload manifest.json",
+            type=accept("json"),
+            key=f"parts_manifest_{manifest_round}",
+            help="Created next to the .part files by split_for_upload.bat.",
+        )
+        manifest = None
+        if manifest_file is not None:
+            try:
+                manifest = parse_manifest(manifest_file.getvalue())
+                # Drop parts from an earlier file or an earlier split.
+                listed = {entry["name"] for entry in manifest["parts"]}
+                upload_dir.mkdir(parents=True, exist_ok=True)
+                for path in upload_dir.glob("*.part"):
+                    if path.name not in listed:
+                        path.unlink(missing_ok=True)
+                save_manifest(upload_dir, manifest)
+            except (ValueError, OSError) as exc:
+                st.error(f"Manifest rejected: {exc}")
+        else:
+            try:
+                manifest = load_manifest(upload_dir)
+                st.caption(f"Manifest already on the server for **{manifest['original_name']}**.")
+            except (OSError, ValueError):
+                manifest = None
+        if manifest is None:
+            st.info("Upload `manifest.json` from the split folder to begin.")
+        else:
+            received, missing = parts_status(upload_dir, manifest)
+            done_bytes = sum(part["bytes"] for part in manifest["parts"] if part["index"] in received)
+            st.progress(
+                len(received) / float(manifest["part_count"]),
+                text=(f"Parts received: {len(received)}/{manifest['part_count']} · "
+                      f"{done_bytes / 1e6:.0f} MB of {manifest['total_bytes'] / 1e6:.0f} MB"),
+            )
+            if missing:
+                st.caption("Next part(s): " + ", ".join(f"{index:03d}" for index in missing[:6])
+                           + (" …" if len(missing) > 6 else ""))
+                upload_round = int(st.session_state.get("parts_upload_round", 0))
+                part_file = st.file_uploader(
+                    "2 · Upload the next .part file",
+                    type=accept("part"),
+                    key=f"parts_upload_{upload_round}",
+                    help="Upload one part per submission. Each part is checked with SHA-256.",
+                )
+                if part_file is not None:
+                    try:
+                        save_part(upload_dir, part_file.name, part_file.getvalue(), manifest)
+                    except ValueError as exc:
+                        st.error(f"Part rejected: {exc}")
+                    except OSError as exc:
+                        st.error(f"Could not save the part on the server: {exc}")
+                    else:
+                        st.session_state["parts_upload_round"] = upload_round + 1
+                        st.rerun()
+            else:
+                st.success("All parts received and checksummed.")
+                if st.button("3 · Assemble full disk", key="parts_assemble", type="primary"):
+                    destination = root / manifest["original_name"]
+                    try:
+                        with st.spinner("Reassembling and checking the NetCDF…"):
+                            assembled = assemble(upload_dir, manifest, destination)
+                            validate_netcdf(assembled)
+                    except Exception as exc:
+                        st.error(f"Assembly failed: {exc}")
+                    else:
+                        (upload_dir / MANIFEST_NAME).unlink(missing_ok=True)
+                        st.session_state["parts_manifest_round"] = manifest_round + 1
+                        st.session_state["parts_upload_round"] = int(st.session_state.get("parts_upload_round", 0)) + 1
+                        st.session_state["parts_just_assembled"] = True
+                        st.rerun()
 
     st.markdown("##### Plot one band")
     single = pick_one("Scene", "sat_single")
