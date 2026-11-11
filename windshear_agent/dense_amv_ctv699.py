@@ -1060,9 +1060,11 @@ def main():
 def process_uploaded_sequence(files, output_dir=None):
     """Run the CTV699 dense three-scene CMV algorithm on uploaded NetCDFs.
 
-    ``files`` is [(filename, bytes), ...] in any order. All scenes must form a
-    consecutive 10-minute sequence with matching grids and cover the CTV699
-    domain. Output files are written only when an output directory is given.
+    ``files`` is [(filename, bytes-or-Path), ...] in any order. A ``Path``
+    points at a scene already saved on disk and is read without copying. All
+    scenes must form a consecutive 10-minute sequence with matching grids and
+    cover the CTV699 domain. Output files are written only when an output
+    directory is given.
     """
     global OUTPUT_DIR
     if len(files) < 3:
@@ -1077,11 +1079,16 @@ def process_uploaded_sequence(files, output_dir=None):
             timestamp = timestamp_from_filename(Path(name))
             if timestamp is None:
                 raise ValueError(f"Could not read timestamp from {Path(name).name}; expected NC_H09_YYYYMMDD_HHMM.")
-            handle = tempfile.NamedTemporaryFile(suffix=".nc", delete=False)
-            handle.write(content)
-            handle.close()
-            path = Path(handle.name)
-            temp_paths.append(path)
+            if isinstance(content, (bytes, bytearray, memoryview)):
+                handle = tempfile.NamedTemporaryFile(suffix=".nc", delete=False)
+                handle.write(content)
+                handle.close()
+                path = Path(handle.name)
+                temp_paths.append(path)
+            else:
+                path = Path(content)
+                if not path.is_file():
+                    raise FileNotFoundError(f"Scene file not found: {path}")
             parsed.append((timestamp, path))
         parsed.sort(key=lambda item:item[0])
         times = [item[0] for item in parsed]
