@@ -32,6 +32,9 @@ def accept(*extensions):
 
 VOL_TYPES = accept("vol")
 NC_TYPES = accept("nc", "nc4", "cdf")
+# Step 2 scene uploads: 1 GB per file (a full-disk R21 NetCDF is ~600 MB).
+# Keep this in sync with server.maxUploadSize in .streamlit/config.toml.
+MAX_SCENE_UPLOAD_MB = 1024
 CSV_TYPES = accept("csv")
 OBS_TYPES = accept("csv", "txt", "metar", "speci")
 SHEET_TYPES = accept("xls", "xlsx", "csv")
@@ -131,19 +134,70 @@ def writable_folder(path):
         with tempfile.NamedTemporaryFile(dir=candidate, prefix=".windshear_", delete=True):
             pass
     except OSError as exc:
-        return None, f"That folder is not writable: {exc}"
+        reason = getattr(exc, "strerror", None) or str(exc)
+        return None, f"That folder is not writable ({reason})."
     return candidate.resolve(), None
 
 
 def default_output_dir():
     """First writable candidate folder for Himawari downloads."""
     for candidate in (home_folder() / "Himawari_9",
+                      Path(tempfile.gettempdir()) / "Himawari_9",
                       Path(__file__).resolve().parent / "Himawari_9",
                       Path.cwd() / "Himawari_9"):
         parent = candidate.parent
         if parent.is_dir() and os.access(parent, os.W_OK):
             return str(candidate)
     return str(Path.cwd())
+
+
+def suggested_output_dir():
+    """Writable example folder for this machine (native path format)."""
+    for candidate in (home_folder() / "Himawari_9",
+                      Path(tempfile.gettempdir()) / "Himawari_9"):
+        if candidate.parent.is_dir() and os.access(candidate.parent, os.W_OK):
+            return candidate
+    return Path(tempfile.gettempdir())
+
+
+def config_path():
+    """JSON file that remembers the last Himawari output folder."""
+    return Path.home() / ".windshear_agent.json"
+
+
+def saved_output_dir():
+    """Folder remembered by a previous session, or an empty string."""
+    try:
+        data = json.loads(config_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    value = str(data.get("himawari_output_dir") or "").strip()
+    if not value or foreign_path_problem(value):
+        return ""
+    return value
+
+
+def save_output_dir(path):
+    """Remember the chosen folder; best effort, never fails a download."""
+    try:
+        config_path().write_text(json.dumps({"himawari_output_dir": str(path)}, indent=2),
+                                 encoding="utf-8")
+    except OSError:
+        pass
+
+
+def hosted_deployment_note():
+    """Explain that a hosted app writes to the server, not the visitor's computer."""
+    try:
+        host = (st.context.headers.get("host") or "").lower()
+    except Exception:
+        return None
+    if host.endswith(".streamlit.app") or host.endswith(".streamlitapp.com"):
+        return ("This app is running on Streamlit Community Cloud, so downloaded scenes are "
+                "saved on the **server**, not on your own computer, and they disappear when the "
+                "app restarts. To save into a folder on your Mac or Windows PC, run the app on "
+                "that computer: `streamlit run streamlit_app.py`.")
+    return None
 
 
 _TK_FOLDER_SCRIPT = r'''
@@ -208,7 +262,7 @@ def os_native_folder_dialog(initial_dir=None, prompt="Select the Himawari output
         script += ")"
         try:
             result = subprocess.run(["osascript", "-e", script],
-                                    capture_output=True, text=True, timeout=600)
+                                    capture_output=True, text=True, timeout=180)
         except (OSError, subprocess.TimeoutExpired):
             return None, "unavailable"
         if result.returncode == 0:
@@ -233,7 +287,7 @@ def os_native_folder_dialog(initial_dir=None, prompt="Select the Himawari output
         for executable in ("powershell", "pwsh"):
             try:
                 result = subprocess.run([executable, "-NoProfile", "-STA", "-Command", script],
-                                        capture_output=True, text=True, timeout=600)
+                                        capture_output=True, text=True, timeout=180)
             except (OSError, subprocess.TimeoutExpired):
                 continue
             if result.returncode != 0:
@@ -247,7 +301,7 @@ def os_native_folder_dialog(initial_dir=None, prompt="Select the Himawari output
     try:
         result = subprocess.run(["zenity", "--file-selection", "--directory",
                                  f"--title={prompt}"],
-                                capture_output=True, text=True, timeout=600)
+                                capture_output=True, text=True, timeout=180)
     except (OSError, subprocess.TimeoutExpired):
         return None, "unavailable"
     if result.returncode == 0:
@@ -279,7 +333,7 @@ def native_folder_dialog(initial_dir=None, prompt="Select the Himawari output fo
             extra["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         result = subprocess.run(
             [sys.executable, "-c", _TK_FOLDER_SCRIPT, str(initial) if initial else "", prompt],
-            capture_output=True, text=True, timeout=600, **extra,
+            capture_output=True, text=True, timeout=180, **extra,
         )
     except subprocess.TimeoutExpired:
         return None, "unavailable"
@@ -505,39 +559,64 @@ def satellite_tab():
     st.subheader("Himawari satellite")
     st.caption("Two steps: download the full disk to a local folder, then analyse scenes from that folder or an uploaded file.")
 
-    initial_output_dir = default_output_dir()
+    # Restore the last folder chosen in a previous session, without creating
+    # anything: a remembered folder that has since moved or become read-only
+    # falls back to the default.
+    initial_output_dir = saved_output_dir()
+    if initial_output_dir:
+        remembered = Path(initial_output_dir)
+        if not (remembered.is_dir() and os.access(remembered, os.W_OK)):
+            initial_output_dir = ""
+    if not initial_output_dir:
+        initial_output_dir = default_output_dir()
     if "hima_output_dir_text" not in st.session_state:
         st.session_state["hima_output_dir_text"] = initial_output_dir
 
-    def _toggle_browser():
-        opening = not st.session_state.get("hima_browser_open", False)
-        st.session_state["hima_browser_open"] = opening
-        if opening:
-            candidate = Path(st.session_state.get("hima_output_dir_text", "")).expanduser()
-            st.session_state["hima_browse_path"] = str(candidate if candidate.is_dir() else home_folder())
-
-    def _use_folder(path):
-        st.session_state["hima_output_dir_text"] = path
+    def _remember(path):
+        """Persist the chosen folder and close the picker."""
+        st.session_state["hima_output_dir_text"] = str(path)
         st.session_state["hima_browser_open"] = False
+        save_output_dir(path)
 
-    def _pick_native():
+    def _open_browser():
         candidate = Path(st.session_state.get("hima_output_dir_text", "")).expanduser()
-        if st.session_state.get("hima_native_unavailable"):
-            # The system dialog failed before; go straight to the in-page browser.
-            st.session_state["hima_browse_path"] = str(candidate if candidate.is_dir() else home_folder())
-            st.session_state["hima_browser_open"] = True
-            return
-        path, status = native_folder_dialog(candidate)
-        if status == "selected" and path:
-            st.session_state["hima_output_dir_text"] = str(Path(path))
+        # A download folder may not exist yet: start at its nearest existing
+        # parent instead of jumping to Home (which may be read-only on a server).
+        start = candidate
+        while not start.is_dir() and start.parent != start:
+            start = start.parent
+        if not start.is_dir():
+            start = home_folder()
+        st.session_state["hima_browse_path"] = str(start)
+        st.session_state["hima_path_input"] = str(start)
+        st.session_state["hima_browser_open"] = True
+
+    def _toggle_browser():
+        if st.session_state.get("hima_browser_open"):
             st.session_state["hima_browser_open"] = False
-        elif status == "unavailable":
-            st.session_state["hima_native_unavailable"] = True
-            st.session_state["hima_browse_path"] = str(candidate if candidate.is_dir() else home_folder())
-            st.session_state["hima_browser_open"] = True
+        else:
+            _open_browser()
 
     def _go(path):
         st.session_state["hima_browse_path"] = str(path)
+        st.session_state["hima_path_input"] = str(path)
+
+    def _open_typed_path():
+        target = Path((st.session_state.get("hima_path_input") or ".").strip() or ".").expanduser()
+        if target.is_dir():
+            st.session_state["hima_path_error"] = ""
+            _go(target)
+        else:
+            st.session_state["hima_path_error"] = f"Not a folder: {target}"
+
+    def _go_temp():
+        """Jump to a folder this app can definitely write to."""
+        target = Path(tempfile.gettempdir()) / "Himawari_9"
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            target = Path(tempfile.gettempdir())
+        _go(target)
 
     def _create_folder(parent):
         name = (st.session_state.get("hima_new_folder") or "").strip()
@@ -547,30 +626,66 @@ def satellite_tab():
         target = Path(parent) / name
         try:
             target.mkdir(parents=True, exist_ok=False)
-            st.session_state["hima_browse_path"] = str(target)
+            _go(target)
             st.session_state["hima_new_folder"] = ""
             st.session_state["hima_folder_error"] = ""
         except Exception as exc:
             st.session_state["hima_folder_error"] = str(exc)
+
+    def _pick_native():
+        candidate = Path(st.session_state.get("hima_output_dir_text", "")).expanduser()
+        if st.session_state.get("hima_native_unavailable"):
+            _open_browser()
+            return
+        path, status = native_folder_dialog(candidate)
+        if status == "selected" and path:
+            _remember(path)
+        elif status == "unavailable":
+            st.session_state["hima_native_unavailable"] = True
+            _open_browser()
 
     def _render_folder_browser():
         current = Path(st.session_state.get("hima_browse_path") or home_folder()).expanduser()
         if not current.is_dir():
             current = home_folder()
         st.session_state["hima_browse_path"] = str(current)
-        st.caption(f"Current folder: `{current}`")
         _, problem = writable_folder(current)
         if problem:
-            st.warning(f"{problem} Choose a folder you can write to.")
-        st.button("Choose this folder", key="hima_use_folder", type="primary",
-                  on_click=_use_folder, args=(str(current),), disabled=bool(problem))
-        st.button("Close browser", key="hima_close_browser", on_click=_toggle_browser,
-                  type="tertiary")
-        nav = st.columns([1, 1, 4])
-        nav[0].button("\u2191 Parent", key="hima_dir_up", on_click=_go,
-                      args=(str(current.parent),), use_container_width=True)
-        nav[1].button("Home", key="hima_dir_home", on_click=_go,
-                      args=(str(home_folder()),), use_container_width=True)
+            st.warning(f"{problem} Choose a folder you can write to — `venv`, `etc` and other "
+                       "system folders are usually read-only.")
+            st.button("Go to a temporary folder", key="hima_fix_temp", on_click=_go_temp,
+                      use_container_width=True,
+                      help="Open a folder this app can write to on this machine.")
+
+        head = st.columns([2, 1, 1])
+        head[0].button("Use this folder", key="hima_use_folder", type="primary",
+                       on_click=_remember, args=(str(current),), disabled=bool(problem),
+                       use_container_width=True)
+        head[1].button("Close", key="hima_close_browser", on_click=_toggle_browser,
+                       use_container_width=True)
+        head[2].button("System dialog\u2026", key="hima_system_dialog", on_click=_pick_native,
+                       use_container_width=True,
+                       help="Try the operating system folder dialog as well.")
+        st.caption(f"Current folder: `{current}`")
+
+        st.text_input("Folder path", key="hima_path_input")
+        st.button("Open path", key="hima_path_open", on_click=_open_typed_path)
+        if st.session_state.get("hima_path_error"):
+            st.error(st.session_state["hima_path_error"])
+
+        quick = [("Home", home_folder()),
+                 ("Desktop", Path.home() / "Desktop"),
+                 ("Downloads", Path.home() / "Downloads"),
+                 ("Documents", Path.home() / "Documents")]
+        quick = [(label, folder) for label, folder in quick if folder.is_dir()]
+        if quick:
+            quick_cols = st.columns(len(quick))
+            for col, (label, folder) in zip(quick_cols, quick):
+                col.button(label, key=f"hima_quick_{label}", on_click=_go,
+                           args=(str(folder),), use_container_width=True)
+
+        st.button("\u2191 Parent", key="hima_dir_up", on_click=_go,
+                  args=(str(current.parent),), use_container_width=True)
         if os.name == "nt" and current.parent == current:
             drives = [Path(f"{letter}:\\") for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ"
                       if Path(f"{letter}:\\").exists()]
@@ -588,7 +703,7 @@ def satellite_tab():
             st.warning(f"Cannot list this folder: {exc}")
             subdirs = []
         if not subdirs:
-            st.caption("No subfolders here. Type a new folder name below, or use this folder.")
+            st.caption("No subfolders here. Create one below, or use this folder.")
         else:
             cols = st.columns(3)
             for index, folder in enumerate(subdirs[:30]):
@@ -605,11 +720,16 @@ def satellite_tab():
                         args=(str(current),), use_container_width=True)
         if st.session_state.get("hima_folder_error"):
             st.error(st.session_state["hima_folder_error"])
+        st.button("Use this folder", key="hima_use_folder_bottom", type="primary",
+                  on_click=_remember, args=(str(current),), disabled=bool(problem))
 
     # ---------------- Step 1: download the full disk ----------------
     st.markdown("#### Step 1 · Download the full disk to a local folder")
     with st.expander("JAXA P-Tree download", expanded=False):
         st.caption("The full-disk NetCDF (about 600 MB per scene) is saved on this machine and kept. Credentials are used for this request only.")
+        note = hosted_deployment_note()
+        if note:
+            st.warning(note)
         username = st.text_input("JAXA username", key="jaxa_user")
         password = st.text_input("JAXA password", type="password", key="jaxa_password")
         c1, c2 = st.columns(2)
@@ -620,24 +740,18 @@ def satellite_tab():
         c1, c2 = st.columns([4, 1], vertical_alignment="bottom")
         output_dir = c1.text_input("Local output folder (type a path or browse)",
                                    key="hima_output_dir_text")
-        c2.button("Browse\u2026", key="hima_browse_btn", on_click=_pick_native,
+        c2.button("Browse\u2026", key="hima_browse_btn", on_click=_toggle_browser,
                   use_container_width=True,
-                  help="Opens the system folder chooser. If that is not available, "
-                       "a folder browser opens inside this page.")
-        st.caption(f"Use this system's path format — example: `{Path.home() / 'Himawari_9'}`")
-        if st.session_state.get("hima_native_unavailable"):
-            st.caption("The folder dialog could not be opened on this machine. "
-                       "Use the folder browser below to pick the download folder.")
-        elif not st.session_state.get("hima_browser_open"):
-            st.button("Browse folders in this page instead", key="hima_browse_inline",
-                      on_click=_toggle_browser, type="tertiary")
+                  help="Opens the folder picker in this section of the page.")
+        st.caption(f"Use this system's path format — example: `{suggested_output_dir()}`. "
+                   "Files are saved on the machine running this app.")
         if st.session_state.get("hima_browser_open"):
             with st.container(border=True):
                 _render_folder_browser()
         if st.button("Download full disk", key="download_hima_full", type="primary"):
             target, problem = writable_folder(output_dir)
             if problem:
-                st.error(f"{problem} Choose a writable folder, for example `{home_folder() / 'Himawari_9'}`.")
+                st.error(f"{problem} Choose a writable folder, for example `{suggested_output_dir()}`.")
             else:
                 progress = st.progress(0, text="Starting download…")
                 try:
@@ -647,6 +761,7 @@ def satellite_tab():
                     result = download_himawari(username, password,
                                                start.strftime("%Y%m%d%H%M"), end.strftime("%Y%m%d%H%M"),
                                                None, str(target), interval, update, crop=False)
+                    save_output_dir(target)
                     st.success(f"Saved {len(result['full_disk_downloaded'])} new full-disk scene(s) to {result['output_dir']}")
                     st.caption("Full-disk files stay on disk on this machine; analyse them in Step 2.")
                     if result["not_found"]:
@@ -677,6 +792,10 @@ def satellite_tab():
                                "Turn off to analyse a file uploaded from the browser instead.")
     if use_local and not local_names:
         st.info("No local scenes yet. Download in Step 1, or turn this toggle off to upload a file.")
+    elif not use_local:
+        st.caption("Browser uploads accept up to **1 GB per scene** (a full-disk R21 file is ~600 MB). "
+                   "Processing a scene that large needs several GB of free RAM; scenes already in the "
+                   "local folder are read directly without uploading.")
 
     def is_roi(name):
         return "_ROI_" in Path(name).name
@@ -693,14 +812,16 @@ def satellite_tab():
         if use_local:
             names = st.multiselect(label, local_names, key=f"{key}_local")
             return [read_local(name) for name in names]
-        files = st.file_uploader(label, type=NC_TYPES, accept_multiple_files=True, key=key, max_upload_size=800)
+        files = st.file_uploader(label, type=NC_TYPES, accept_multiple_files=True, key=key,
+                                 max_upload_size=MAX_SCENE_UPLOAD_MB)
         return uploaded_pairs(files or [])
 
     def pick_one(label, key):
         if use_local:
             name = st.selectbox(label, [""] + local_names, key=f"{key}_local")
             return read_local(name) if name else None
-        uploaded = st.file_uploader(label, type=NC_TYPES, key=key, max_upload_size=800)
+        uploaded = st.file_uploader(label, type=NC_TYPES, key=key,
+                                    max_upload_size=MAX_SCENE_UPLOAD_MB)
         return (uploaded.name, uploaded.getvalue()) if uploaded else None
 
     st.markdown("##### Plot one band")
