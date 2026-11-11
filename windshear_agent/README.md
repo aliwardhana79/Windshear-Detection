@@ -31,11 +31,31 @@ Uploads are processed in memory and sent to the configured model provider. Up to
 
 ## Satellite workflow (Streamlit "Satellite Analyze" tab)
 
-The tab runs in three explicit steps:
+The tab runs in two explicit steps:
 
-1. **Download the full disk** from JAXA P-Tree into a local folder. Type the path directly or use **Browse…** to navigate the folders on this machine, create a new folder, and select it. The full-disk NetCDF is kept on disk (roughly 600 MB per scene); only missing scenes are fetched again.
-2. **Crop** any saved full disk to a south/north/west/east box. The ROI copy is written next to the full disk as `..._ROI_<south>_<west>_<north>_<east>.nc`; the original file is left untouched, so a new box can be cropped later without re-downloading.
-3. **Analyse** the cropped scenes directly from that folder — no browser upload. Plotting, two-scene motion, and cooling use the crop's own extent, so boxes outside the Juanda area also work. The dense cloud-motion overlay is still drawn for Juanda.
+1. **Download the full disk** from JAXA P-Tree into a local folder. The default is `~/Himawari_9`, and the last folder you chose is remembered across restarts (`~/.windshear_agent.json`). Type the path directly, or press **Browse…** to open the folder picker inside the page: quick locations (Home, Desktop, Downloads, Documents), single-click navigation with **↑ Parent**, Windows drive buttons at a drive root, an editable path bar, new-folder creation, and **Use this folder** at the top and bottom. A **System dialog…** button inside the picker also tries the operating system dialog (Tk in a child process, Finder *choose folder* on macOS, the Shell folder dialog on Windows, `zenity` on Linux), but the in-page picker works without it — no Tk package is required. On Windows any drive can be selected, including a secondary data drive such as `D:\Himawari_9`. Paths are shown in the native format — `C:\Users\<you>\Himawari_9` on Windows, `/Users/<you>/Himawari_9` on macOS — and a path written for another operating system (for example a Linux `/home/...` path on macOS) is rejected with a hint instead of creating a stray folder. Folders the current user cannot write to are rejected before the download starts. The full-disk NetCDF is kept on disk (roughly 600 MB per scene); only missing scenes are fetched again.
+2. **Analyse** scenes directly from that folder — no browser upload — or upload a file from the browser instead. Files in the local folder are opened from disk and only the Juanda slice is read, so a ~600 MB full disk does not have to fit in memory. Browser uploads in Step 2 accept up to **1 GB per scene** (a full-disk R21 NetCDF is ~600 MB), set by `maxUploadSize = 1024` in `.streamlit/config.toml` and `max_upload_size=1024` in `streamlit_app.py`. A single 600 MB upload to a hosted app may still fail with HTTP 500 because the platform holds the whole request in memory; use the parts workflow below in that case. Full-disk scenes are sliced to the default Juanda window; any cropped `*_ROI_*.nc` files already in the folder are analysed on their own extent, so crops produced by `crop_saved_products()` or the Flask app work too and appear automatically in the scene list. The dense cloud-motion overlay is still drawn for Juanda.
+
+**Where downloads are saved.** The folder is always on the machine that runs this app. On a hosted deployment (for example Streamlit Community Cloud) that is the server container, not the computer you view the page from: the picker can only reach server folders such as `/tmp/Himawari_9`, the ~600 MB scenes use the server's ephemeral disk, and they are lost when the app restarts. To save into a folder on your own Mac or Windows PC, run `streamlit run streamlit_app.py` on that computer and open `http://localhost:8501`. System folders such as `/etc`, `/usr` or a Python `venv` are read-only; the picker warns and offers a temporary folder when you land in one.
+
+### Upload a full disk to a hosted app in parts
+
+Community Cloud rejects a single ~600 MB browser upload. To analyse a full disk there without running the app locally:
+
+1. On your computer, drag the `NC_H09_...nc` file onto `split_for_upload.bat` (or run `python split_for_upload.py FILE`). A `FILE_parts` folder is created next to it containing `manifest.json` and 100 MB `.part` files. Use `python split_for_upload.py --part-mb=50 FILE` if the server still rejects a part.
+2. In **Satellite Analyze → Step 2**, open **Large scene · upload a full disk in parts**. Upload `manifest.json`, then each `.part` file one at a time. Each part is checked with SHA-256 as it arrives; the panel shows how many parts and megabytes are still missing.
+3. When all parts are present, press **Assemble full disk**. The parts are joined into the output folder, the full-file checksum is verified, the NetCDF is opened once to confirm it has latitude/longitude fields, and the scene appears in the local scene list.
+
+The parts and the assembled scene live on the server's temporary disk. The panel shows the free space before you upload; about 0.8 GB is needed for one 600 MB scene. A container restart loses the parts, in which case you upload them again. This workflow moves the whole file through several smaller requests — it does not make the scene persist on your PC, and it does not bypass the server's disk limit.
+
+### Run on Windows (to save into `C:\`)
+
+1. Install Python 3.11 from <https://www.python.org/downloads/> and tick **Add python.exe to PATH** during setup.
+2. Copy this project folder to the PC, for example `C:\Windshear`.
+3. Double-click `run_windows.bat`. The first start creates `.venv` and installs the requirements (a few minutes); later starts are quick.
+4. In **Satellite Analyze → Step 1**, set *Local output folder* to `C:\Himawari_9`. **Browse…** shows this PC's drives — go to `C:\`, use **New folder** to create `Himawari_9`, then **Use this folder**. Typing the path directly also works; the folder is created on the first download.
+
+Run the app on the same PC that should hold the files. A hosted deployment writes to its Linux server, not to `C:\`, no matter what path is typed.
 
 JAXA credentials are used for the FTP request only and are not written to disk.
 
