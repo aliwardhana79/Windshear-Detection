@@ -152,15 +152,6 @@ def default_output_dir():
     return str(Path.cwd())
 
 
-def suggested_output_dir():
-    """Writable example folder for this machine (native path format)."""
-    for candidate in (home_folder() / "Himawari_9",
-                      Path(tempfile.gettempdir()) / "Himawari_9"):
-        if candidate.parent.is_dir() and os.access(candidate.parent, os.W_OK):
-            return candidate
-    return Path(tempfile.gettempdir())
-
-
 def config_path():
     """JSON file that remembers the last Himawari output folder."""
     return Path.home() / ".windshear_agent.json"
@@ -176,15 +167,6 @@ def saved_output_dir():
     if not value or foreign_path_problem(value):
         return ""
     return value
-
-
-def save_output_dir(path):
-    """Remember the chosen folder; best effort, never fails a download."""
-    try:
-        config_path().write_text(json.dumps({"himawari_output_dir": str(path)}, indent=2),
-                                 encoding="utf-8")
-    except OSError:
-        pass
 
 
 def hosted_deployment_note():
@@ -212,158 +194,6 @@ def free_disk_space(path):
         return shutil.disk_usage(candidate).free
     except OSError:
         return None
-
-
-_TK_FOLDER_SCRIPT = r'''
-import sys
-
-if len(sys.argv) < 3:
-    raise SystemExit(4)
-
-initial, title = sys.argv[1], sys.argv[2]
-try:
-    import tkinter
-    from tkinter import filedialog
-except Exception:
-    raise SystemExit(3)
-
-try:
-    root = tkinter.Tk()
-except Exception:
-    raise SystemExit(3)
-
-try:
-    root.withdraw()
-    try:
-        root.attributes("-topmost", True)
-        root.lift()
-        root.focus_force()
-    except Exception:
-        pass
-    root.update_idletasks()
-    options = {"title": title, "mustexist": True}
-    if initial:
-        options["initialdir"] = initial
-    chosen = filedialog.askdirectory(**options)
-finally:
-    try:
-        root.destroy()
-    except Exception:
-        pass
-
-print(chosen or "")
-'''
-
-
-def os_native_folder_dialog(initial_dir=None, prompt="Select the Himawari output folder"):
-    """OS folder chooser used when the interpreter has no Tk support.
-
-    Finder's *choose folder* on macOS, the Shell folder dialog on Windows and
-    ``zenity`` on Linux. Returns the same ``(path, status)`` tuple as
-    :func:`native_folder_dialog`.
-    """
-    import subprocess
-    import sys
-
-    initial = Path(str(initial_dir)).expanduser() if initial_dir else None
-    if initial is not None and not initial.is_dir():
-        initial = None
-
-    if sys.platform == "darwin":
-        script = f'POSIX path of (choose folder with prompt "{prompt}"'
-        if initial is not None:
-            script += f' default location POSIX file "{str(initial).replace(chr(34), chr(92) + chr(34))}"'
-        script += ")"
-        try:
-            result = subprocess.run(["osascript", "-e", script],
-                                    capture_output=True, text=True, timeout=180)
-        except (OSError, subprocess.TimeoutExpired):
-            return None, "unavailable"
-        if result.returncode == 0:
-            chosen = (result.stdout or "").strip()
-            return (str(Path(chosen)), "selected") if chosen else (None, "cancelled")
-        if "-128" in (result.stderr or "") or "cancel" in (result.stderr or "").lower():
-            return None, "cancelled"
-        return None, "unavailable"
-
-    if sys.platform.startswith("win"):
-        quoted_prompt = prompt.replace("'", "''")
-        quoted_initial = str(initial).replace("'", "''") if initial is not None else ""
-        script = ("Add-Type -AssemblyName System.Windows.Forms;"
-                  "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog;"
-                  f"$dialog.Description = '{quoted_prompt}';"
-                  "$dialog.ShowNewFolderButton = $true;")
-        if quoted_initial:
-            script += f"$dialog.SelectedPath = '{quoted_initial}';"
-        script += ("$answer = $dialog.ShowDialog();"
-                   "if ($answer -eq [System.Windows.Forms.DialogResult]::OK) {"
-                   " Write-Output $dialog.SelectedPath }")
-        for executable in ("powershell", "pwsh"):
-            try:
-                result = subprocess.run([executable, "-NoProfile", "-STA", "-Command", script],
-                                        capture_output=True, text=True, timeout=180)
-            except (OSError, subprocess.TimeoutExpired):
-                continue
-            if result.returncode != 0:
-                continue
-            lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
-            if lines:
-                return str(Path(lines[-1])), "selected"
-            return None, "cancelled"
-        return None, "unavailable"
-
-    try:
-        result = subprocess.run(["zenity", "--file-selection", "--directory",
-                                 f"--title={prompt}"],
-                                capture_output=True, text=True, timeout=180)
-    except (OSError, subprocess.TimeoutExpired):
-        return None, "unavailable"
-    if result.returncode == 0:
-        chosen = (result.stdout or "").strip()
-        return (str(Path(chosen)), "selected") if chosen else (None, "cancelled")
-    return None, "cancelled"
-
-
-def native_folder_dialog(initial_dir=None, prompt="Select the Himawari output folder"):
-    """Open one cross-platform folder chooser.
-
-    The Tk dialog runs in a child process, so it never touches Streamlit's
-    script thread and the same code path is used on Windows, macOS and Linux.
-    If the interpreter has no Tk (common with Homebrew Python), the operating
-    system's own dialog is used instead. Returns ``(path, status)`` with
-    status ``selected``, ``cancelled`` or ``unavailable``; a headless machine
-    returns ``unavailable`` and the caller falls back to the in-page browser.
-    """
-    import subprocess
-    import sys
-
-    initial = Path(str(initial_dir)).expanduser() if initial_dir else None
-    if initial is not None and not initial.is_dir():
-        initial = None
-
-    try:
-        extra = {}
-        if sys.platform.startswith("win"):
-            extra["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        result = subprocess.run(
-            [sys.executable, "-c", _TK_FOLDER_SCRIPT, str(initial) if initial else "", prompt],
-            capture_output=True, text=True, timeout=180, **extra,
-        )
-    except subprocess.TimeoutExpired:
-        return None, "unavailable"
-    except OSError:
-        return os_native_folder_dialog(initial, prompt)
-
-    if result.returncode != 0:
-        # No Tk in this interpreter (or no display): use the OS dialog.
-        return os_native_folder_dialog(initial, prompt)
-
-    chosen = (result.stdout or "").strip()
-    if not chosen:
-        return None, "cancelled"
-    # str(Path(...)) renders the native separator: C:/Users/... -> C:\Users\...
-    # on Windows, and leaves POSIX paths unchanged on macOS.
-    return str(Path(chosen)), "selected"
 
 
 def make_analysis_docx(html):
@@ -566,183 +396,97 @@ def radar_tab():
 
 def satellite_tab():
     from satellite_analysis import (process_satellite_file, process_motion_files,
-                                    process_convective_cooling_files, JUANDA_REGION, CTV699_REGION)
+                                    process_convective_cooling_files, JUANDA_REGION, CTV699_REGION,
+                                    HIMAWARI_BAND_IDS, HIMAWARI_BAND_LABELS,
+                                    HIMAWARI_BAND_VARIABLES, DEFAULT_MOTION_BANDS)
     from dense_amv_ctv699 import process_uploaded_sequence
+    import gdrive_upload
     from himawari_download import download_himawari, list_local_products
     from scene_parts import (MANIFEST_NAME, assemble, load_manifest, parse_manifest,
                              parts_status, save_manifest, save_part, validate_netcdf)
 
     st.subheader("Himawari satellite")
-    st.caption("Two steps: download the full disk to a local folder, then analyse scenes from that folder or an uploaded file.")
+    st.caption("Two steps: load the Himawari full disk and choose its bands, then analyse scenes from that folder or an uploaded file.")
 
-    # Restore the last folder chosen in a previous session, without creating
-    # anything: a remembered folder that has since moved or become read-only
-    # falls back to the default.
-    initial_output_dir = saved_output_dir()
-    if initial_output_dir:
-        remembered = Path(initial_output_dir)
-        if not (remembered.is_dir() and os.access(remembered, os.W_OK)):
-            initial_output_dir = ""
-    if not initial_output_dir:
-        initial_output_dir = default_output_dir()
-    if "hima_output_dir_text" not in st.session_state:
-        st.session_state["hima_output_dir_text"] = initial_output_dir
+    # The output folder is fixed for this deployment: load the previously
+    # saved location (or the platform default) and only display it.
+    output_dir = saved_output_dir()
+    if output_dir:
+        _, folder_problem = writable_folder(output_dir)
+        if folder_problem:
+            output_dir = ""
+    if not output_dir:
+        output_dir = default_output_dir()
+    st.caption(f"**Local output folder:** `{output_dir}` (loaded automatically)")
 
-    def _remember(path):
-        """Persist the chosen folder and close the picker."""
-        st.session_state["hima_output_dir_text"] = str(path)
-        st.session_state["hima_browser_open"] = False
-        save_output_dir(path)
+    # Google Drive is optional. The local copy is always kept for Step 2.
+    drive_settings = gdrive_upload.load_settings()
+    drive_problem = gdrive_upload.configuration_error(drive_settings)
+    if "gdrive_enabled" not in st.session_state:
+        st.session_state["gdrive_enabled"] = drive_problem is None
 
-    def _open_browser():
-        candidate = Path(st.session_state.get("hima_output_dir_text", "")).expanduser()
-        # A download folder may not exist yet: start at its nearest existing
-        # parent instead of jumping to Home (which may be read-only on a server).
-        start = candidate
-        while not start.is_dir() and start.parent != start:
-            start = start.parent
-        if not start.is_dir():
-            start = home_folder()
-        st.session_state["hima_browse_path"] = str(start)
-        st.session_state["hima_path_input"] = str(start)
-        st.session_state["hima_browser_open"] = True
-
-    def _toggle_browser():
-        if st.session_state.get("hima_browser_open"):
-            st.session_state["hima_browser_open"] = False
-        else:
-            _open_browser()
-
-    def _go(path):
-        st.session_state["hima_browse_path"] = str(path)
-        st.session_state["hima_path_input"] = str(path)
-
-    def _open_typed_path():
-        target = Path((st.session_state.get("hima_path_input") or ".").strip() or ".").expanduser()
-        if target.is_dir():
-            st.session_state["hima_path_error"] = ""
-            _go(target)
-        else:
-            st.session_state["hima_path_error"] = f"Not a folder: {target}"
-
-    def _go_temp():
-        """Jump to a folder this app can definitely write to."""
-        target = Path(tempfile.gettempdir()) / "Himawari_9"
-        try:
-            target.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            target = Path(tempfile.gettempdir())
-        _go(target)
-
-    def _create_folder(parent):
-        name = (st.session_state.get("hima_new_folder") or "").strip()
-        if not name:
-            st.session_state["hima_folder_error"] = "Enter a folder name first."
+    def _drive_upload(paths):
+        """Copy local scenes to Drive; never stop the app when it fails."""
+        paths = [Path(path) for path in paths]
+        if not paths:
             return
-        target = Path(parent) / name
+        progress = st.progress(0, text="Preparing Google Drive copy…")
+
+        def update(item):
+            total = max(1, int(item.get("file_total", 1)))
+            index = max(1, int(item.get("file_index", 1)))
+            fraction = min(1.0, max(0.0, float(item.get("fraction", 0.0))))
+            overall = ((index - 1) + fraction) / total
+            progress.progress(
+                min(100, int(overall * 100)),
+                text=(f"Google Drive · {item.get('file_name', '')} · "
+                      f"{int(fraction * 100)}%"),
+            )
+
         try:
-            target.mkdir(parents=True, exist_ok=False)
-            _go(target)
-            st.session_state["hima_new_folder"] = ""
-            st.session_state["hima_folder_error"] = ""
+            report = gdrive_upload.upload_files(paths, settings=drive_settings,
+                                                progress=update)
         except Exception as exc:
-            st.session_state["hima_folder_error"] = str(exc)
-
-    def _pick_native():
-        candidate = Path(st.session_state.get("hima_output_dir_text", "")).expanduser()
-        if st.session_state.get("hima_native_unavailable"):
-            _open_browser()
+            progress.empty()
+            st.warning(f"Google Drive copy failed: {exc}")
             return
-        path, status = native_folder_dialog(candidate)
-        if status == "selected" and path:
-            _remember(path)
-        elif status == "unavailable":
-            st.session_state["hima_native_unavailable"] = True
-            _open_browser()
+        progress.empty()
+        uploaded, skipped, failed = (report["uploaded"], report["skipped"],
+                                     report["failed"])
+        destination = report.get("destination") or {}
+        if destination.get("webViewLink"):
+            st.caption(f"Google Drive folder: "
+                       f"[{destination.get('name') or 'Himawari_9'}]"
+                       f"({destination['webViewLink']})")
+        if uploaded:
+            st.success(f"Copied {len(uploaded)} scene(s) to Google Drive.")
+        if skipped:
+            st.caption(f"{len(skipped)} scene(s) already in Google Drive with the "
+                       "same size; skipped.")
+        if uploaded or skipped:
+            rows = [{"scene": entry["name"], "status": "uploaded",
+                     "link": entry.get("link")} for entry in uploaded]
+            rows += [{"scene": entry["name"], "status": "already there",
+                      "link": entry.get("link")} for entry in skipped]
+            st.dataframe(
+                pd.DataFrame(rows), hide_index=True, use_container_width=True,
+                column_config={"link": st.column_config.LinkColumn("Drive link")},
+            )
+        for entry in failed[:5]:
+            st.warning(f"{entry['name']}: {entry['error']}")
+        if len(failed) > 5:
+            st.caption(f"{len(failed) - 5} more file(s) failed.")
 
-    def _render_folder_browser():
-        current = Path(st.session_state.get("hima_browse_path") or home_folder()).expanduser()
-        if not current.is_dir():
-            current = home_folder()
-        st.session_state["hima_browse_path"] = str(current)
-        _, problem = writable_folder(current)
-        if problem:
-            st.warning(f"{problem} Choose a folder you can write to — `venv`, `etc` and other "
-                       "system folders are usually read-only.")
-            st.button("Go to a temporary folder", key="hima_fix_temp", on_click=_go_temp,
-                      use_container_width=True,
-                      help="Open a folder this app can write to on this machine.")
+    def _select_all_bands():
+        st.session_state["himawari_bands"] = list(HIMAWARI_BAND_IDS)
 
-        head = st.columns([2, 1, 1])
-        head[0].button("Use this folder", key="hima_use_folder", type="primary",
-                       on_click=_remember, args=(str(current),), disabled=bool(problem),
-                       use_container_width=True)
-        head[1].button("Close", key="hima_close_browser", on_click=_toggle_browser,
-                       use_container_width=True)
-        head[2].button("System dialog\u2026", key="hima_system_dialog", on_click=_pick_native,
-                       use_container_width=True,
-                       help="Try the operating system folder dialog as well.")
-        st.caption(f"Current folder: `{current}`")
+    def _clear_bands():
+        st.session_state["himawari_bands"] = []
 
-        st.text_input("Folder path", key="hima_path_input")
-        st.button("Open path", key="hima_path_open", on_click=_open_typed_path)
-        if st.session_state.get("hima_path_error"):
-            st.error(st.session_state["hima_path_error"])
-
-        quick = [("Home", home_folder()),
-                 ("Desktop", Path.home() / "Desktop"),
-                 ("Downloads", Path.home() / "Downloads"),
-                 ("Documents", Path.home() / "Documents")]
-        quick = [(label, folder) for label, folder in quick if folder.is_dir()]
-        if quick:
-            quick_cols = st.columns(len(quick))
-            for col, (label, folder) in zip(quick_cols, quick):
-                col.button(label, key=f"hima_quick_{label}", on_click=_go,
-                           args=(str(folder),), use_container_width=True)
-
-        st.button("\u2191 Parent", key="hima_dir_up", on_click=_go,
-                  args=(str(current.parent),), use_container_width=True)
-        if os.name == "nt" and current.parent == current:
-            drives = [Path(f"{letter}:\\") for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ"
-                      if Path(f"{letter}:\\").exists()]
-            if drives:
-                st.caption("Drives")
-                drive_cols = st.columns(min(len(drives), 6))
-                for index, drive in enumerate(drives):
-                    drive_cols[index % len(drive_cols)].button(
-                        str(drive), key=f"hima_drive_{drive.drive}", on_click=_go,
-                        args=(str(drive),), use_container_width=True)
-        try:
-            subdirs = sorted((p for p in current.iterdir() if p.is_dir() and not p.name.startswith(".")),
-                             key=lambda p: p.name.lower())
-        except OSError as exc:
-            st.warning(f"Cannot list this folder: {exc}")
-            subdirs = []
-        if not subdirs:
-            st.caption("No subfolders here. Create one below, or use this folder.")
-        else:
-            cols = st.columns(3)
-            for index, folder in enumerate(subdirs[:30]):
-                cols[index % 3].button(f"\U0001F4C1 {folder.name}",
-                                       key=f"hima_dir_{abs(hash(str(folder)))}",
-                                       on_click=_go, args=(str(folder),),
-                                       use_container_width=True)
-            if len(subdirs) > 30:
-                st.caption(f"Showing 30 of {len(subdirs)} folders.")
-        new_col, make_col = st.columns([3, 1], vertical_alignment="bottom")
-        new_col.text_input("New folder name", key="hima_new_folder",
-                           placeholder="e.g. Himawari_CGK")
-        make_col.button("Create", key="hima_make_folder", on_click=_create_folder,
-                        args=(str(current),), use_container_width=True)
-        if st.session_state.get("hima_folder_error"):
-            st.error(st.session_state["hima_folder_error"])
-        st.button("Use this folder", key="hima_use_folder_bottom", type="primary",
-                  on_click=_remember, args=(str(current),), disabled=bool(problem))
-
-    # ---------------- Step 1: download the full disk ----------------
-    st.markdown("#### Step 1 · Download the full disk to a local folder")
-    with st.expander("JAXA P-Tree download", expanded=False):
-        st.caption("The full-disk NetCDF (about 600 MB per scene) is saved on this machine and kept. Credentials are used for this request only.")
+    # ---------------- Step 1: load the full disk ----------------
+    st.markdown("#### Step 1 · Load Himawari full disk")
+    with st.expander("JAXA P-Tree download", expanded=True):
+        st.caption("Choose the UTC time window, interval and bands. The full-disk NetCDF (about 600 MB per scene) is saved on this machine and kept. Credentials are used for this request only.")
         note = hosted_deployment_note()
         if note:
             st.warning(note)
@@ -752,22 +496,58 @@ def satellite_tab():
         now_utc = datetime.now(timezone.utc).replace(tzinfo=None, second=0, microsecond=0)
         start = c1.datetime_input("Start time (UTC)", value=now_utc)
         end = c2.datetime_input("End time (UTC)", value=now_utc)
-        interval = st.selectbox("Interval (minutes)", [10, 20, 30, 60])
-        c1, c2 = st.columns([4, 1], vertical_alignment="bottom")
-        output_dir = c1.text_input("Local output folder (type a path or browse)",
-                                   key="hima_output_dir_text")
-        c2.button("Browse\u2026", key="hima_browse_btn", on_click=_toggle_browser,
-                  use_container_width=True,
-                  help="Opens the folder picker in this section of the page.")
-        st.caption(f"Use this system's path format — example: `{suggested_output_dir()}`. "
-                   "Files are saved on the machine running this app.")
-        if st.session_state.get("hima_browser_open"):
+        interval = st.selectbox(
+            "Interval (minutes)", [10, 20, 30, 60],
+            help="10 minutes matches the standard Himawari full-disk cadence and is required by "
+                 "the dense cloud-motion sequence. Two-scene feature motion works with any "
+                 "interval of 5 minutes or more.",
+        )
+        band_left, band_all, band_clear = st.columns([6, 1, 1], vertical_alignment="bottom")
+        if "himawari_bands" not in st.session_state:
+            st.session_state["himawari_bands"] = list(HIMAWARI_BAND_IDS)
+        with band_left:
+            selected_bands = st.multiselect(
+                "Himawari bands to make available for analysis",
+                options=list(HIMAWARI_BAND_IDS),
+                format_func=HIMAWARI_BAND_LABELS.get,
+                key="himawari_bands",
+                help="All 16 AHI bands are stored in every JAXA R21 full-disk file. "
+                     "This selection controls which bands Step 2 offers for plotting and motion.",
+            )
+        band_all.button("All 16", key="hima_bands_all", on_click=_select_all_bands,
+                        use_container_width=True)
+        band_clear.button("Clear", key="hima_bands_clear", on_click=_clear_bands,
+                          use_container_width=True)
+        if not selected_bands:
+            st.warning("No bands selected. Step 2 will fall back to Band 13; select bands above to analyse others.")
+        else:
+            st.caption(f"{len(selected_bands)} band(s) selected. Each JAXA file still contains all 16 bands.")
+        if not drive_problem:
             with st.container(border=True):
-                _render_folder_browser()
+                st.markdown("**Google Drive copy**")
+                st.caption(f"Optional. Downloaded full-disk scenes are also copied to "
+                           f"**{gdrive_upload.destination_label(drive_settings)}**. The local "
+                           "files stay here for Step 2.")
+                st.checkbox("Copy downloaded scenes to Google Drive", key="gdrive_enabled",
+                            help="Runs after the JAXA download. A failed Drive copy does not "
+                                 "remove or affect the local file.")
+                if st.button("Test Google Drive connection", key="gdrive_test"):
+                    try:
+                        with st.spinner("Contacting Google Drive…"):
+                            destination = gdrive_upload.test_connection(drive_settings)
+                    except Exception as exc:
+                        st.error(f"Google Drive connection failed: {exc}")
+                    else:
+                        link = destination.get("webViewLink")
+                        name = destination.get("name") or "Google Drive folder"
+                        if link:
+                            st.success(f"Connected to [{name}]({link}).")
+                        else:
+                            st.success(f"Connected to {name}.")
         if st.button("Download full disk", key="download_hima_full", type="primary"):
             target, problem = writable_folder(output_dir)
             if problem:
-                st.error(f"{problem} Choose a writable folder, for example `{suggested_output_dir()}`.")
+                st.error(f"The output folder is not writable: {problem}")
             else:
                 progress = st.progress(0, text="Starting download…")
                 try:
@@ -777,9 +557,19 @@ def satellite_tab():
                     result = download_himawari(username, password,
                                                start.strftime("%Y%m%d%H%M"), end.strftime("%Y%m%d%H%M"),
                                                None, str(target), interval, update, crop=False)
-                    save_output_dir(target)
                     st.success(f"Saved {len(result['full_disk_downloaded'])} new full-disk scene(s) to {result['output_dir']}")
                     st.caption("Full-disk files stay on disk on this machine; analyse them in Step 2.")
+                    if result["full_disk_downloaded"]:
+                        # The Step 2 toggle is created later in this run; switch it
+                        # on before that so the new scene is ready to analyse.
+                        st.session_state["sat_use_local"] = True
+                    if result["full_disk_downloaded"] and not drive_problem \
+                            and st.session_state.get("gdrive_enabled"):
+                        _drive_upload([target / name
+                                       for name in result["full_disk_downloaded"]])
+                    elif not drive_problem and st.session_state.get("gdrive_enabled"):
+                        st.caption("Google Drive: no new scene to copy. Existing local "
+                                   "scenes are unchanged; use Step 2 to copy one manually.")
                     if result["not_found"]:
                         with st.expander(f"Not available at JAXA ({len(result['not_found'])})"):
                             st.dataframe(pd.DataFrame(result["not_found"]), use_container_width=True, hide_index=True)
@@ -791,7 +581,14 @@ def satellite_tab():
                     st.error(f"Download failed: {exc}")
 
     # ---------------- Step 2: analyse scenes ----------------
-    st.markdown("#### Step 2 · Analyse scenes from the local folder or an upload")
+    st.markdown("#### Step 2 · Analyse Himawari scenes")
+    available_bands = [band for band in selected_bands if band in HIMAWARI_BAND_VARIABLES]
+    if not available_bands:
+        available_bands = ["B13"]
+    if st.session_state.get("sat_band") not in available_bands:
+        st.session_state["sat_band"] = "B13" if "B13" in available_bands else available_bands[0]
+    st.caption("The band menus below use the Step 1 selection: "
+               + ", ".join(available_bands) + ".")
     root = Path(output_dir).expanduser().resolve()
     inventory = list_local_products(root)
     local_names = [item["name"] for item in inventory["roi"] + inventory["full_disk"]]
@@ -938,9 +735,38 @@ def satellite_tab():
                         st.session_state["parts_just_assembled"] = True
                         st.rerun()
 
+    if not drive_problem:
+        with st.expander("Google Drive · save a local scene", expanded=False):
+            st.caption(f"Copies scenes from `{root}` to "
+                       f"**{gdrive_upload.destination_label(drive_settings)}**. Use this for "
+                       "Cloud downloads or a scene assembled from parts, so it survives a "
+                       "container restart.")
+            if not local_names:
+                st.info("No local scenes to copy yet. Download in Step 1, or assemble an "
+                        "uploaded scene above.")
+            else:
+                drive_pick = st.multiselect(
+                    "Scene(s) to copy to Google Drive", local_names,
+                    key="gdrive_scene_pick",
+                    help="The local file is not removed. A 600 MB scene uploads in "
+                         "resumable 8 MB chunks.",
+                )
+                if st.button(
+                    f"Copy {len(drive_pick)} scene(s) to Google Drive",
+                    key="gdrive_upload_local", disabled=not drive_pick,
+                ):
+                    _drive_upload([root / name for name in drive_pick])
+
     st.markdown("##### Plot one band")
     single = pick_one("Scene", "sat_single")
-    variable = st.text_input("Variable name (optional; auto-selects Band 13)", key="sat_variable")
+    plot_band = st.selectbox("Band", options=available_bands,
+                             format_func=HIMAWARI_BAND_LABELS.get, key="sat_band")
+    with st.expander("Advanced: NetCDF variable override"):
+        variable_override = st.text_input(
+            "Variable name", key="sat_variable",
+            placeholder=HIMAWARI_BAND_VARIABLES[plot_band],
+            help="Leave blank to use the standard variable for the selected band.")
+    variable = (variable_override or "").strip() or HIMAWARI_BAND_VARIABLES[plot_band]
     if st.button("Plot field", key="plot_sat"):
         if not single:
             st.error("Choose a scene first.")
@@ -963,12 +789,26 @@ def satellite_tab():
                 st.error(f"Satellite plotting failed: {exc}")
 
     st.markdown("##### Two-scene feature-motion approximation")
+    st.caption("Choose two scenes; the interval is read from their filenames (at least 5 minutes).")
     c1, c2 = st.columns(2)
     with c1:
         earlier = pick_one("Earlier scene", "motion_1")
     with c2:
-        later = pick_one("Later scene (10 minutes after)", "motion_2")
-    if st.button("Estimate motion for Bands 3, 7 and 13", key="run_motion"):
+        later = pick_one("Later scene", "motion_2")
+    motion_defaults = [band for band in DEFAULT_MOTION_BANDS if band in available_bands]
+    if not motion_defaults:
+        motion_defaults = available_bands[:1]
+    current_motion = st.session_state.get("sat_motion_bands")
+    if current_motion is None or (current_motion and any(band not in available_bands for band in current_motion)):
+        st.session_state["sat_motion_bands"] = motion_defaults
+    motion_bands = st.multiselect(
+        "Bands for motion", options=available_bands,
+        format_func=HIMAWARI_BAND_LABELS.get, key="sat_motion_bands",
+        help="Defaults to B03, B07 and B13 when available. A band that cannot be tracked "
+             "is reported without stopping the other bands.",
+    )
+    if st.button(f"Estimate feature motion · {len(motion_bands)} band(s)", key="run_motion",
+                 disabled=not motion_bands):
         if not earlier or not later:
             st.error("Choose both scenes.")
         else:
@@ -976,18 +816,22 @@ def satellite_tab():
                 if use_local and local_region(later[0]) != local_region(earlier[0]):
                     raise ValueError("Choose two scenes of the same kind: both full-disk or both cropped to one box.")
                 with st.spinner("Tracking image features…"):
-                    result = process_motion_files([earlier, later], region=local_region(earlier[0]) if use_local else JUANDA_REGION)
+                    result = process_motion_files([earlier, later], band=tuple(motion_bands),
+                                                  region=local_region(earlier[0]) if use_local else JUANDA_REGION)
                 st.session_state["comprehensive_satellite_motion"] = {
                     "files": [earlier[0], later[0]],
                     "bands": [{k: v for k, v in band.items() if k not in ("preview",)} for band in result.get("bands", [])],
+                    "failures": result.get("failures", []),
                     "caveat": result.get("caveat", ""),
                 }
                 st.warning(result["caveat"])
                 for band in result["bands"]:
-                    st.markdown(f"**Band {band['band']} · {band['variable']} · {band['time_delta_minutes']} minute interval**")
+                    st.markdown(f"**Band B{band['band']:02d} · {band['variable']} · {band['time_delta_minutes']:g}-minute interval**")
                     show_b64_image(band["preview"]["png_base64"])
                     st.json({k: v for k, v in band.items() if k not in ("preview", "caveat")})
                     st.caption(band["caveat"])
+                for failure in result.get("failures", []):
+                    st.info(f"Band B{failure['band']:02d} ({failure['variable']}): {failure['error']}")
             except Exception as exc:
                 st.error(f"Motion estimate failed: {exc}")
 
