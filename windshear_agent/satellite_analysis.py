@@ -16,6 +16,30 @@ from view_rainbow_vol import add_map_context
 JUANDA_REGION = (112.1, 113.25, -8.15, -6.8)
 CTV699_REGION = (112.0, 113.5, -8.0, -6.5)
 
+# Himawari-9 AHI bands as stored in the JAXA P-Tree R21 full-disk NetCDF.
+HIMAWARI_BANDS = (
+    ("B01", "0.47 µm visible", "albedo_01"),
+    ("B02", "0.51 µm visible", "albedo_02"),
+    ("B03", "0.64 µm visible", "albedo_03"),
+    ("B04", "0.86 µm near-infrared", "albedo_04"),
+    ("B05", "1.6 µm near-infrared", "albedo_05"),
+    ("B06", "2.3 µm near-infrared", "albedo_06"),
+    ("B07", "3.9 µm shortwave infrared", "tbb_07"),
+    ("B08", "6.2 µm water vapour", "tbb_08"),
+    ("B09", "6.9 µm water vapour", "tbb_09"),
+    ("B10", "7.3 µm water vapour", "tbb_10"),
+    ("B11", "8.6 µm cloud phase", "tbb_11"),
+    ("B12", "9.6 µm ozone", "tbb_12"),
+    ("B13", "10.4 µm thermal infrared", "tbb_13"),
+    ("B14", "11.2 µm thermal infrared", "tbb_14"),
+    ("B15", "12.4 µm thermal infrared", "tbb_15"),
+    ("B16", "13.3 µm CO₂", "tbb_16"),
+)
+HIMAWARI_BAND_IDS = tuple(band for band, _, _ in HIMAWARI_BANDS)
+HIMAWARI_BAND_VARIABLES = {band: variable for band, _, variable in HIMAWARI_BANDS}
+HIMAWARI_BAND_LABELS = {band: f"{band} · {desc}" for band, desc, _ in HIMAWARI_BANDS}
+DEFAULT_MOTION_BANDS = ("B03", "B07", "B13")
+
 
 def _region_indices(lat, lon, region):
     """Return index arrays for a (west, east, south, north) box.
@@ -149,15 +173,60 @@ def process_satellite_file(filename: str, content, variable: str = "", region=JU
     }
 
 
+def _band_id(value):
+    """Normalize band names such as ``13``, ``B13`` or ``b03`` to ``"13"``."""
+    text = str(value).strip().upper()
+    if text.startswith("B"):
+        text = text[1:]
+    if not re.fullmatch(r"\d{1,2}", text):
+        raise ValueError(f"Invalid Himawari band {value!r}; choose B01–B16.")
+    text = text.zfill(2)
+    if f"B{text}" not in HIMAWARI_BAND_VARIABLES:
+        raise ValueError(f"Invalid Himawari band {value!r}; choose B01–B16.")
+    return text
+
+
 def process_motion_files(files, band="all", region=JUANDA_REGION):
-    """Process the same two scenes for Bands 3, 7, and 13 automatically."""
-    bands = ("03", "07", "13") if str(band).lower() in ("all", "auto", "") else (str(band).zfill(2),)
-    products = [_process_motion_band(files, selected_band, region) for selected_band in bands]
+    """Process the same two scenes for one or more Himawari bands.
+
+    ``band`` may be ``"13"``/``"B13"``, a sequence such as ``["03", "07"]``,
+    or ``"all"``/``"auto"`` for the default B03, B07 and B13 combination.
+    Bands that cannot produce vectors are reported individually instead of
+    aborting every other requested band.
+    """
+    if band is None or (isinstance(band, str) and band.strip().lower() in ("all", "auto", "")):
+        selected = tuple(_band_id(item) for item in DEFAULT_MOTION_BANDS)
+    elif isinstance(band, (str, int)):
+        selected = (_band_id(band),)
+    else:
+        selected = tuple(_band_id(item) for item in band)
+    bands = tuple(dict.fromkeys(selected)) or tuple(_band_id(item) for item in DEFAULT_MOTION_BANDS)
+    products, failures = [], []
+    for selected_band in bands:
+        try:
+            products.append(_process_motion_band(files, selected_band, region))
+        except Exception as exc:
+            failures.append({"band": int(selected_band),
+                             "variable": HIMAWARI_BAND_VARIABLES[f"B{selected_band}"],
+                             "error": str(exc)})
+    if not products:
+        detail = "; ".join(f"B{failure['band']:02d}: {failure['error']}" for failure in failures)
+        raise ValueError(f"No band produced a feature-motion estimate ({detail}).")
+    caveat = (
+        "Each panel shows band-specific image-feature displacement. These are not complete or "
+        "validated AMV winds: no cloud-height assignment, radiative-transfer/first-guess profile, "
+        "parallax correction, full JMA quality index, or sonde validation is applied. In particular, "
+        "Band 7 (3.9 µm) is not the paper's 7.0 µm water-vapor channel (Band 10). Visible and "
+        "near-infrared bands (B01–B06) only carry usable signal in daylight. Not for operational use."
+    )
+    if failures:
+        caveat += " Some selected bands did not produce vectors; see the per-band notes."
     return {
         "bands": products,
+        "failures": failures,
         "files": products[0]["files"],
         "time_delta_minutes": products[0]["time_delta_minutes"],
-        "caveat": "Each panel shows band-specific image-feature displacement. These are not complete or validated AMV winds: no cloud-height assignment, radiative-transfer/first-guess profile, parallax correction, full JMA quality index, or sonde validation is applied. In particular, Band 7 (3.9 µm) is not the paper's 7.0 µm water-vapor channel (Band 10). Not for operational use.",
+        "caveat": caveat,
     }
 
 
@@ -264,11 +333,9 @@ def _process_motion_band(files, band="13", region=JUANDA_REGION):
     not a cloud-height-corrected operational Atmospheric Motion Vector product.
     """
     if len(files) != 2:
-        raise ValueError("Select exactly two Himawari files separated by 10 minutes.")
-    if not re.fullmatch(r"(?:03|07|13)", str(band)):
-        raise ValueError("Choose Himawari band 3, 7, or 13.")
-    band = str(band).zfill(2)
-    variable = ("albedo_" if band == "03" else "tbb_") + band
+        raise ValueError("Select exactly two Himawari files with different observation times.")
+    band = _band_id(band)
+    variable = HIMAWARI_BAND_VARIABLES[f"B{band}"]
 
     frames = []
     for filename, content in files:
@@ -305,8 +372,10 @@ def _process_motion_band(files, band="13", region=JUANDA_REGION):
     if frames[0][4] is None or frames[1][4] is None:
         raise ValueError("Could not read observation times from both filenames; expected NC_H09_YYYYMMDD_HHMM files.")
     selected_interval = (frames[1][4] - frames[0][4]).total_seconds() / 60
-    if selected_interval != 10:
-        raise ValueError(f"The two files must be exactly 10 minutes apart; selected interval is {selected_interval:g} minutes.")
+    if selected_interval <= 0:
+        raise ValueError("Choose two scenes with increasing observation times.")
+    if selected_interval < 5:
+        raise ValueError(f"The two scenes are only {selected_interval:g} minutes apart; choose at least 5 minutes.")
     base_name, base, lat, lon, base_time = frames[0]
     for name, other, other_lat, other_lon, timestamp in frames[1:]:
         if other.shape != base.shape or not np.allclose(other_lat, lat) or not np.allclose(other_lon, lon):
@@ -324,8 +393,8 @@ def _process_motion_band(files, band="13", region=JUANDA_REGION):
     t0, t1 = _filename_time(reference_name), _filename_time(latest_name)
     if t0 and t1:
         time_delta_minutes = (t1 - t0).total_seconds() / 60
-    if time_delta_minutes != 10:
-        raise ValueError("Selected Himawari files must be exactly 10 minutes apart.")
+    if time_delta_minutes is None or time_delta_minutes <= 0:
+        raise ValueError("Could not determine a positive time separation from the selected files.")
 
     # Paper-inspired tracking: four normalized-correlation surfaces (7x7 and
     # 33x33 targets, forward and backward), reverse the backward surfaces,
@@ -412,7 +481,7 @@ def _process_motion_band(files, band="13", region=JUANDA_REGION):
             zorder=20)
     ax.set_xlabel("Longitude (°E)")
     ax.set_ylabel("Latitude (°; negative = °S)")
-    ax.set_title(f"Paper-inspired Himawari Band {int(band)} apparent feature motion · 10-minute interval")
+    ax.set_title(f"Paper-inspired Himawari Band {int(band)} apparent feature motion · {time_delta_minutes:g}-minute interval")
     fig.colorbar(speed_mesh, ax=ax, label="Interpolated apparent feature speed (m/s)", shrink=0.8)
     output = io.BytesIO()
     with contextlib.redirect_stdout(io.StringIO()):
@@ -428,7 +497,7 @@ def _process_motion_band(files, band="13", region=JUANDA_REGION):
                        "median_correlation": round(float(np.median(vectors[:, 4])), 3),
                        "median_forward_backward_error_pixels": round(float(np.median(vectors[:, 5])), 2)},
         "preview": {"png_base64": base64.b64encode(output.getvalue()).decode("ascii")},
-        "caveat": "Research-only, paper-inspired tracking approximation: averages 7x7 and 33x33 forward/backward correlation surfaces and applies a 0.75 correlation plus 2-pixel forward/backward consistency screen. This is not a reproduction of JMA AMV: no optimal-estimation cloud-height assignment, radiative-transfer/first-guess wind profile, parallax correction, full JMA quality index, or sonde validation is implemented. Himawari Band 7 is 3.9 µm, not the paper's 7.0 µm water-vapor channel (Band 10). Vectors are apparent image-feature motion, not surface wind or runway windshear, and are not for operational use.",
+        "caveat": "Research-only, paper-inspired tracking approximation: averages 7x7 and 33x33 forward/backward correlation surfaces and applies a 0.75 correlation plus 2-pixel forward/backward consistency screen. This is not a reproduction of JMA AMV: no optimal-estimation cloud-height assignment, radiative-transfer/first-guess wind profile, parallax correction, full JMA quality index, or sonde validation is implemented. Himawari Band 7 is 3.9 µm, not the paper's 7.0 µm water-vapor channel (Band 10). Visible and near-infrared bands (B01–B06) are only usable in daylight. Vectors are apparent image-feature motion, not surface wind or runway windshear, and are not for operational use.",
     }
 
 
