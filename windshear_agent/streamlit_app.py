@@ -522,15 +522,8 @@ def satellite_tab():
             st.warning("No bands selected. Step 2 will fall back to Band 13; select bands above to analyse others.")
         else:
             st.caption(f"{len(selected_bands)} band(s) selected. Each JAXA file still contains all 16 bands.")
-        with st.container(border=True):
-            if drive_problem:
-                st.markdown("**Google Drive copy** · not configured")
-                st.caption("Optional. Add `[gdrive]` credentials to "
-                           "`.streamlit/secrets.toml` (or the Cloud secrets editor), then "
-                           "reboot the app. See **README → Save scenes to Google Drive**.")
-                st.checkbox("Copy downloaded scenes to Google Drive", key="gdrive_enabled",
-                            disabled=True)
-            else:
+        if not drive_problem:
+            with st.container(border=True):
                 st.markdown("**Google Drive copy**")
                 st.caption(f"Optional. Downloaded full-disk scenes are also copied to "
                            f"**{gdrive_upload.destination_label(drive_settings)}**. The local "
