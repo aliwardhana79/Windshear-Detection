@@ -544,7 +544,7 @@ def satellite_tab():
                             st.success(f"Connected to [{name}]({link}).")
                         else:
                             st.success(f"Connected to {name}.")
-        if st.button("Download full disk", key="download_hima_full", type="primary"):
+        if st.button("Display Full Disk", key="download_hima_full", type="primary"):
             target, problem = writable_folder(output_dir)
             if problem:
                 st.error(f"The output folder is not writable: {problem}")
