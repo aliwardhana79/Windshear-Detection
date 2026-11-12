@@ -400,6 +400,7 @@ def satellite_tab():
                                     HIMAWARI_BAND_IDS, HIMAWARI_BAND_LABELS,
                                     HIMAWARI_BAND_VARIABLES, DEFAULT_MOTION_BANDS)
     from dense_amv_ctv699 import process_uploaded_sequence
+    import gdrive_upload
     from himawari_download import download_himawari, list_local_products
     from scene_parts import (MANIFEST_NAME, assemble, load_manifest, parse_manifest,
                              parts_status, save_manifest, save_part, validate_netcdf)
@@ -417,6 +418,64 @@ def satellite_tab():
     if not output_dir:
         output_dir = default_output_dir()
     st.caption(f"**Local output folder:** `{output_dir}` (loaded automatically)")
+
+    # Google Drive is optional. The local copy is always kept for Step 2.
+    drive_settings = gdrive_upload.load_settings()
+    drive_problem = gdrive_upload.configuration_error(drive_settings)
+    if "gdrive_enabled" not in st.session_state:
+        st.session_state["gdrive_enabled"] = drive_problem is None
+
+    def _drive_upload(paths):
+        """Copy local scenes to Drive; never stop the app when it fails."""
+        paths = [Path(path) for path in paths]
+        if not paths:
+            return
+        progress = st.progress(0, text="Preparing Google Drive copy…")
+
+        def update(item):
+            total = max(1, int(item.get("file_total", 1)))
+            index = max(1, int(item.get("file_index", 1)))
+            fraction = min(1.0, max(0.0, float(item.get("fraction", 0.0))))
+            overall = ((index - 1) + fraction) / total
+            progress.progress(
+                min(100, int(overall * 100)),
+                text=(f"Google Drive · {item.get('file_name', '')} · "
+                      f"{int(fraction * 100)}%"),
+            )
+
+        try:
+            report = gdrive_upload.upload_files(paths, settings=drive_settings,
+                                                progress=update)
+        except Exception as exc:
+            progress.empty()
+            st.warning(f"Google Drive copy failed: {exc}")
+            return
+        progress.empty()
+        uploaded, skipped, failed = (report["uploaded"], report["skipped"],
+                                     report["failed"])
+        destination = report.get("destination") or {}
+        if destination.get("webViewLink"):
+            st.caption(f"Google Drive folder: "
+                       f"[{destination.get('name') or 'Himawari_9'}]"
+                       f"({destination['webViewLink']})")
+        if uploaded:
+            st.success(f"Copied {len(uploaded)} scene(s) to Google Drive.")
+        if skipped:
+            st.caption(f"{len(skipped)} scene(s) already in Google Drive with the "
+                       "same size; skipped.")
+        if uploaded or skipped:
+            rows = [{"scene": entry["name"], "status": "uploaded",
+                     "link": entry.get("link")} for entry in uploaded]
+            rows += [{"scene": entry["name"], "status": "already there",
+                      "link": entry.get("link")} for entry in skipped]
+            st.dataframe(
+                pd.DataFrame(rows), hide_index=True, use_container_width=True,
+                column_config={"link": st.column_config.LinkColumn("Drive link")},
+            )
+        for entry in failed[:5]:
+            st.warning(f"{entry['name']}: {entry['error']}")
+        if len(failed) > 5:
+            st.caption(f"{len(failed) - 5} more file(s) failed.")
 
     def _select_all_bands():
         st.session_state["himawari_bands"] = list(HIMAWARI_BAND_IDS)
@@ -463,6 +522,35 @@ def satellite_tab():
             st.warning("No bands selected. Step 2 will fall back to Band 13; select bands above to analyse others.")
         else:
             st.caption(f"{len(selected_bands)} band(s) selected. Each JAXA file still contains all 16 bands.")
+        with st.container(border=True):
+            if drive_problem:
+                st.markdown("**Google Drive copy** · not configured")
+                st.caption("Optional. Add `[gdrive]` credentials to "
+                           "`.streamlit/secrets.toml` (or the Cloud secrets editor), then "
+                           "reboot the app. See **README → Save scenes to Google Drive**.")
+                st.checkbox("Copy downloaded scenes to Google Drive", key="gdrive_enabled",
+                            disabled=True)
+            else:
+                st.markdown("**Google Drive copy**")
+                st.caption(f"Optional. Downloaded full-disk scenes are also copied to "
+                           f"**{gdrive_upload.destination_label(drive_settings)}**. The local "
+                           "files stay here for Step 2.")
+                st.checkbox("Copy downloaded scenes to Google Drive", key="gdrive_enabled",
+                            help="Runs after the JAXA download. A failed Drive copy does not "
+                                 "remove or affect the local file.")
+                if st.button("Test Google Drive connection", key="gdrive_test"):
+                    try:
+                        with st.spinner("Contacting Google Drive…"):
+                            destination = gdrive_upload.test_connection(drive_settings)
+                    except Exception as exc:
+                        st.error(f"Google Drive connection failed: {exc}")
+                    else:
+                        link = destination.get("webViewLink")
+                        name = destination.get("name") or "Google Drive folder"
+                        if link:
+                            st.success(f"Connected to [{name}]({link}).")
+                        else:
+                            st.success(f"Connected to {name}.")
         if st.button("Download full disk", key="download_hima_full", type="primary"):
             target, problem = writable_folder(output_dir)
             if problem:
@@ -478,6 +566,17 @@ def satellite_tab():
                                                None, str(target), interval, update, crop=False)
                     st.success(f"Saved {len(result['full_disk_downloaded'])} new full-disk scene(s) to {result['output_dir']}")
                     st.caption("Full-disk files stay on disk on this machine; analyse them in Step 2.")
+                    if result["full_disk_downloaded"]:
+                        # The Step 2 toggle is created later in this run; switch it
+                        # on before that so the new scene is ready to analyse.
+                        st.session_state["sat_use_local"] = True
+                    if result["full_disk_downloaded"] and not drive_problem \
+                            and st.session_state.get("gdrive_enabled"):
+                        _drive_upload([target / name
+                                       for name in result["full_disk_downloaded"]])
+                    elif not drive_problem and st.session_state.get("gdrive_enabled"):
+                        st.caption("Google Drive: no new scene to copy. Existing local "
+                                   "scenes are unchanged; use Step 2 to copy one manually.")
                     if result["not_found"]:
                         with st.expander(f"Not available at JAXA ({len(result['not_found'])})"):
                             st.dataframe(pd.DataFrame(result["not_found"]), use_container_width=True, hide_index=True)
@@ -642,6 +741,28 @@ def satellite_tab():
                         st.session_state["parts_upload_round"] = int(st.session_state.get("parts_upload_round", 0)) + 1
                         st.session_state["parts_just_assembled"] = True
                         st.rerun()
+
+    if not drive_problem:
+        with st.expander("Google Drive · save a local scene", expanded=False):
+            st.caption(f"Copies scenes from `{root}` to "
+                       f"**{gdrive_upload.destination_label(drive_settings)}**. Use this for "
+                       "Cloud downloads or a scene assembled from parts, so it survives a "
+                       "container restart.")
+            if not local_names:
+                st.info("No local scenes to copy yet. Download in Step 1, or assemble an "
+                        "uploaded scene above.")
+            else:
+                drive_pick = st.multiselect(
+                    "Scene(s) to copy to Google Drive", local_names,
+                    key="gdrive_scene_pick",
+                    help="The local file is not removed. A 600 MB scene uploads in "
+                         "resumable 8 MB chunks.",
+                )
+                if st.button(
+                    f"Copy {len(drive_pick)} scene(s) to Google Drive",
+                    key="gdrive_upload_local", disabled=not drive_pick,
+                ):
+                    _drive_upload([root / name for name in drive_pick])
 
     st.markdown("##### Plot one band")
     single = pick_one("Scene", "sat_single")
