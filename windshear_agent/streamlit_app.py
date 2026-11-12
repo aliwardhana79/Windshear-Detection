@@ -152,15 +152,6 @@ def default_output_dir():
     return str(Path.cwd())
 
 
-def suggested_output_dir():
-    """Writable example folder for this machine (native path format)."""
-    for candidate in (home_folder() / "Himawari_9",
-                      Path(tempfile.gettempdir()) / "Himawari_9"):
-        if candidate.parent.is_dir() and os.access(candidate.parent, os.W_OK):
-            return candidate
-    return Path(tempfile.gettempdir())
-
-
 def config_path():
     """JSON file that remembers the last Himawari output folder."""
     return Path.home() / ".windshear_agent.json"
@@ -176,15 +167,6 @@ def saved_output_dir():
     if not value or foreign_path_problem(value):
         return ""
     return value
-
-
-def save_output_dir(path):
-    """Remember the chosen folder; best effort, never fails a download."""
-    try:
-        config_path().write_text(json.dumps({"himawari_output_dir": str(path)}, indent=2),
-                                 encoding="utf-8")
-    except OSError:
-        pass
 
 
 def hosted_deployment_note():
@@ -212,158 +194,6 @@ def free_disk_space(path):
         return shutil.disk_usage(candidate).free
     except OSError:
         return None
-
-
-_TK_FOLDER_SCRIPT = r'''
-import sys
-
-if len(sys.argv) < 3:
-    raise SystemExit(4)
-
-initial, title = sys.argv[1], sys.argv[2]
-try:
-    import tkinter
-    from tkinter import filedialog
-except Exception:
-    raise SystemExit(3)
-
-try:
-    root = tkinter.Tk()
-except Exception:
-    raise SystemExit(3)
-
-try:
-    root.withdraw()
-    try:
-        root.attributes("-topmost", True)
-        root.lift()
-        root.focus_force()
-    except Exception:
-        pass
-    root.update_idletasks()
-    options = {"title": title, "mustexist": True}
-    if initial:
-        options["initialdir"] = initial
-    chosen = filedialog.askdirectory(**options)
-finally:
-    try:
-        root.destroy()
-    except Exception:
-        pass
-
-print(chosen or "")
-'''
-
-
-def os_native_folder_dialog(initial_dir=None, prompt="Select the Himawari output folder"):
-    """OS folder chooser used when the interpreter has no Tk support.
-
-    Finder's *choose folder* on macOS, the Shell folder dialog on Windows and
-    ``zenity`` on Linux. Returns the same ``(path, status)`` tuple as
-    :func:`native_folder_dialog`.
-    """
-    import subprocess
-    import sys
-
-    initial = Path(str(initial_dir)).expanduser() if initial_dir else None
-    if initial is not None and not initial.is_dir():
-        initial = None
-
-    if sys.platform == "darwin":
-        script = f'POSIX path of (choose folder with prompt "{prompt}"'
-        if initial is not None:
-            script += f' default location POSIX file "{str(initial).replace(chr(34), chr(92) + chr(34))}"'
-        script += ")"
-        try:
-            result = subprocess.run(["osascript", "-e", script],
-                                    capture_output=True, text=True, timeout=180)
-        except (OSError, subprocess.TimeoutExpired):
-            return None, "unavailable"
-        if result.returncode == 0:
-            chosen = (result.stdout or "").strip()
-            return (str(Path(chosen)), "selected") if chosen else (None, "cancelled")
-        if "-128" in (result.stderr or "") or "cancel" in (result.stderr or "").lower():
-            return None, "cancelled"
-        return None, "unavailable"
-
-    if sys.platform.startswith("win"):
-        quoted_prompt = prompt.replace("'", "''")
-        quoted_initial = str(initial).replace("'", "''") if initial is not None else ""
-        script = ("Add-Type -AssemblyName System.Windows.Forms;"
-                  "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog;"
-                  f"$dialog.Description = '{quoted_prompt}';"
-                  "$dialog.ShowNewFolderButton = $true;")
-        if quoted_initial:
-            script += f"$dialog.SelectedPath = '{quoted_initial}';"
-        script += ("$answer = $dialog.ShowDialog();"
-                   "if ($answer -eq [System.Windows.Forms.DialogResult]::OK) {"
-                   " Write-Output $dialog.SelectedPath }")
-        for executable in ("powershell", "pwsh"):
-            try:
-                result = subprocess.run([executable, "-NoProfile", "-STA", "-Command", script],
-                                        capture_output=True, text=True, timeout=180)
-            except (OSError, subprocess.TimeoutExpired):
-                continue
-            if result.returncode != 0:
-                continue
-            lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
-            if lines:
-                return str(Path(lines[-1])), "selected"
-            return None, "cancelled"
-        return None, "unavailable"
-
-    try:
-        result = subprocess.run(["zenity", "--file-selection", "--directory",
-                                 f"--title={prompt}"],
-                                capture_output=True, text=True, timeout=180)
-    except (OSError, subprocess.TimeoutExpired):
-        return None, "unavailable"
-    if result.returncode == 0:
-        chosen = (result.stdout or "").strip()
-        return (str(Path(chosen)), "selected") if chosen else (None, "cancelled")
-    return None, "cancelled"
-
-
-def native_folder_dialog(initial_dir=None, prompt="Select the Himawari output folder"):
-    """Open one cross-platform folder chooser.
-
-    The Tk dialog runs in a child process, so it never touches Streamlit's
-    script thread and the same code path is used on Windows, macOS and Linux.
-    If the interpreter has no Tk (common with Homebrew Python), the operating
-    system's own dialog is used instead. Returns ``(path, status)`` with
-    status ``selected``, ``cancelled`` or ``unavailable``; a headless machine
-    returns ``unavailable`` and the caller falls back to the in-page browser.
-    """
-    import subprocess
-    import sys
-
-    initial = Path(str(initial_dir)).expanduser() if initial_dir else None
-    if initial is not None and not initial.is_dir():
-        initial = None
-
-    try:
-        extra = {}
-        if sys.platform.startswith("win"):
-            extra["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        result = subprocess.run(
-            [sys.executable, "-c", _TK_FOLDER_SCRIPT, str(initial) if initial else "", prompt],
-            capture_output=True, text=True, timeout=180, **extra,
-        )
-    except subprocess.TimeoutExpired:
-        return None, "unavailable"
-    except OSError:
-        return os_native_folder_dialog(initial, prompt)
-
-    if result.returncode != 0:
-        # No Tk in this interpreter (or no display): use the OS dialog.
-        return os_native_folder_dialog(initial, prompt)
-
-    chosen = (result.stdout or "").strip()
-    if not chosen:
-        return None, "cancelled"
-    # str(Path(...)) renders the native separator: C:/Users/... -> C:\Users\...
-    # on Windows, and leaves POSIX paths unchanged on macOS.
-    return str(Path(chosen)), "selected"
 
 
 def make_analysis_docx(html):
@@ -577,175 +407,22 @@ def satellite_tab():
     st.subheader("Himawari satellite")
     st.caption("Two steps: load the Himawari full disk and choose its bands, then analyse scenes from that folder or an uploaded file.")
 
-    # Restore the last folder chosen in a previous session, without creating
-    # anything: a remembered folder that has since moved or become read-only
-    # falls back to the default.
-    initial_output_dir = saved_output_dir()
-    if initial_output_dir:
-        remembered = Path(initial_output_dir)
-        if not (remembered.is_dir() and os.access(remembered, os.W_OK)):
-            initial_output_dir = ""
-    if not initial_output_dir:
-        initial_output_dir = default_output_dir()
-    if "hima_output_dir_text" not in st.session_state:
-        st.session_state["hima_output_dir_text"] = initial_output_dir
-
-    def _remember(path):
-        """Persist the chosen folder and close the picker."""
-        st.session_state["hima_output_dir_text"] = str(path)
-        st.session_state["hima_browser_open"] = False
-        save_output_dir(path)
-
-    def _open_browser():
-        candidate = Path(st.session_state.get("hima_output_dir_text", "")).expanduser()
-        # A download folder may not exist yet: start at its nearest existing
-        # parent instead of jumping to Home (which may be read-only on a server).
-        start = candidate
-        while not start.is_dir() and start.parent != start:
-            start = start.parent
-        if not start.is_dir():
-            start = home_folder()
-        st.session_state["hima_browse_path"] = str(start)
-        st.session_state["hima_path_input"] = str(start)
-        st.session_state["hima_browser_open"] = True
-
-    def _toggle_browser():
-        if st.session_state.get("hima_browser_open"):
-            st.session_state["hima_browser_open"] = False
-        else:
-            _open_browser()
-
-    def _go(path):
-        st.session_state["hima_browse_path"] = str(path)
-        st.session_state["hima_path_input"] = str(path)
-
-    def _open_typed_path():
-        target = Path((st.session_state.get("hima_path_input") or ".").strip() or ".").expanduser()
-        if target.is_dir():
-            st.session_state["hima_path_error"] = ""
-            _go(target)
-        else:
-            st.session_state["hima_path_error"] = f"Not a folder: {target}"
-
-    def _go_temp():
-        """Jump to a folder this app can definitely write to."""
-        target = Path(tempfile.gettempdir()) / "Himawari_9"
-        try:
-            target.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            target = Path(tempfile.gettempdir())
-        _go(target)
-
-    def _create_folder(parent):
-        name = (st.session_state.get("hima_new_folder") or "").strip()
-        if not name:
-            st.session_state["hima_folder_error"] = "Enter a folder name first."
-            return
-        target = Path(parent) / name
-        try:
-            target.mkdir(parents=True, exist_ok=False)
-            _go(target)
-            st.session_state["hima_new_folder"] = ""
-            st.session_state["hima_folder_error"] = ""
-        except Exception as exc:
-            st.session_state["hima_folder_error"] = str(exc)
-
-    def _pick_native():
-        candidate = Path(st.session_state.get("hima_output_dir_text", "")).expanduser()
-        if st.session_state.get("hima_native_unavailable"):
-            _open_browser()
-            return
-        path, status = native_folder_dialog(candidate)
-        if status == "selected" and path:
-            _remember(path)
-        elif status == "unavailable":
-            st.session_state["hima_native_unavailable"] = True
-            _open_browser()
+    # The output folder is fixed for this deployment: load the previously
+    # saved location (or the platform default) and only display it.
+    output_dir = saved_output_dir()
+    if output_dir:
+        _, folder_problem = writable_folder(output_dir)
+        if folder_problem:
+            output_dir = ""
+    if not output_dir:
+        output_dir = default_output_dir()
+    st.caption(f"**Local output folder:** `{output_dir}` (loaded automatically)")
 
     def _select_all_bands():
         st.session_state["himawari_bands"] = list(HIMAWARI_BAND_IDS)
 
     def _clear_bands():
         st.session_state["himawari_bands"] = []
-
-    def _render_folder_browser():
-        current = Path(st.session_state.get("hima_browse_path") or home_folder()).expanduser()
-        if not current.is_dir():
-            current = home_folder()
-        st.session_state["hima_browse_path"] = str(current)
-        _, problem = writable_folder(current)
-        if problem:
-            st.warning(f"{problem} Choose a folder you can write to — `venv`, `etc` and other "
-                       "system folders are usually read-only.")
-            st.button("Go to a temporary folder", key="hima_fix_temp", on_click=_go_temp,
-                      use_container_width=True,
-                      help="Open a folder this app can write to on this machine.")
-
-        head = st.columns([2, 1, 1])
-        head[0].button("Use this folder", key="hima_use_folder", type="primary",
-                       on_click=_remember, args=(str(current),), disabled=bool(problem),
-                       use_container_width=True)
-        head[1].button("Close", key="hima_close_browser", on_click=_toggle_browser,
-                       use_container_width=True)
-        head[2].button("System dialog\u2026", key="hima_system_dialog", on_click=_pick_native,
-                       use_container_width=True,
-                       help="Try the operating system folder dialog as well.")
-        st.caption(f"Current folder: `{current}`")
-
-        st.text_input("Folder path", key="hima_path_input")
-        st.button("Open path", key="hima_path_open", on_click=_open_typed_path)
-        if st.session_state.get("hima_path_error"):
-            st.error(st.session_state["hima_path_error"])
-
-        quick = [("Home", home_folder()),
-                 ("Desktop", Path.home() / "Desktop"),
-                 ("Downloads", Path.home() / "Downloads"),
-                 ("Documents", Path.home() / "Documents")]
-        quick = [(label, folder) for label, folder in quick if folder.is_dir()]
-        if quick:
-            quick_cols = st.columns(len(quick))
-            for col, (label, folder) in zip(quick_cols, quick):
-                col.button(label, key=f"hima_quick_{label}", on_click=_go,
-                           args=(str(folder),), use_container_width=True)
-
-        st.button("\u2191 Parent", key="hima_dir_up", on_click=_go,
-                  args=(str(current.parent),), use_container_width=True)
-        if os.name == "nt" and current.parent == current:
-            drives = [Path(f"{letter}:\\") for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ"
-                      if Path(f"{letter}:\\").exists()]
-            if drives:
-                st.caption("Drives")
-                drive_cols = st.columns(min(len(drives), 6))
-                for index, drive in enumerate(drives):
-                    drive_cols[index % len(drive_cols)].button(
-                        str(drive), key=f"hima_drive_{drive.drive}", on_click=_go,
-                        args=(str(drive),), use_container_width=True)
-        try:
-            subdirs = sorted((p for p in current.iterdir() if p.is_dir() and not p.name.startswith(".")),
-                             key=lambda p: p.name.lower())
-        except OSError as exc:
-            st.warning(f"Cannot list this folder: {exc}")
-            subdirs = []
-        if not subdirs:
-            st.caption("No subfolders here. Create one below, or use this folder.")
-        else:
-            cols = st.columns(3)
-            for index, folder in enumerate(subdirs[:30]):
-                cols[index % 3].button(f"\U0001F4C1 {folder.name}",
-                                       key=f"hima_dir_{abs(hash(str(folder)))}",
-                                       on_click=_go, args=(str(folder),),
-                                       use_container_width=True)
-            if len(subdirs) > 30:
-                st.caption(f"Showing 30 of {len(subdirs)} folders.")
-        new_col, make_col = st.columns([3, 1], vertical_alignment="bottom")
-        new_col.text_input("New folder name", key="hima_new_folder",
-                           placeholder="e.g. Himawari_CGK")
-        make_col.button("Create", key="hima_make_folder", on_click=_create_folder,
-                        args=(str(current),), use_container_width=True)
-        if st.session_state.get("hima_folder_error"):
-            st.error(st.session_state["hima_folder_error"])
-        st.button("Use this folder", key="hima_use_folder_bottom", type="primary",
-                  on_click=_remember, args=(str(current),), disabled=bool(problem))
 
     # ---------------- Step 1: load the full disk ----------------
     st.markdown("#### Step 1 · Load Himawari full disk")
@@ -786,21 +463,10 @@ def satellite_tab():
             st.warning("No bands selected. Step 2 will fall back to Band 13; select bands above to analyse others.")
         else:
             st.caption(f"{len(selected_bands)} band(s) selected. Each JAXA file still contains all 16 bands.")
-        c1, c2 = st.columns([4, 1], vertical_alignment="bottom")
-        output_dir = c1.text_input("Local output folder (type a path or browse)",
-                                   key="hima_output_dir_text")
-        c2.button("Browse\u2026", key="hima_browse_btn", on_click=_toggle_browser,
-                  use_container_width=True,
-                  help="Opens the folder picker in this section of the page.")
-        st.caption(f"Use this system's path format — example: `{suggested_output_dir()}`. "
-                   "Files are saved on the machine running this app.")
-        if st.session_state.get("hima_browser_open"):
-            with st.container(border=True):
-                _render_folder_browser()
         if st.button("Download full disk", key="download_hima_full", type="primary"):
             target, problem = writable_folder(output_dir)
             if problem:
-                st.error(f"{problem} Choose a writable folder, for example `{suggested_output_dir()}`.")
+                st.error(f"The output folder is not writable: {problem}")
             else:
                 progress = st.progress(0, text="Starting download…")
                 try:
@@ -810,7 +476,6 @@ def satellite_tab():
                     result = download_himawari(username, password,
                                                start.strftime("%Y%m%d%H%M"), end.strftime("%Y%m%d%H%M"),
                                                None, str(target), interval, update, crop=False)
-                    save_output_dir(target)
                     st.success(f"Saved {len(result['full_disk_downloaded'])} new full-disk scene(s) to {result['output_dir']}")
                     st.caption("Full-disk files stay on disk on this machine; analyse them in Step 2.")
                     if result["not_found"]:
