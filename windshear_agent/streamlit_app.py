@@ -566,14 +566,16 @@ def radar_tab():
 
 def satellite_tab():
     from satellite_analysis import (process_satellite_file, process_motion_files,
-                                    process_convective_cooling_files, JUANDA_REGION, CTV699_REGION)
+                                    process_convective_cooling_files, JUANDA_REGION, CTV699_REGION,
+                                    HIMAWARI_BAND_IDS, HIMAWARI_BAND_LABELS,
+                                    HIMAWARI_BAND_VARIABLES, DEFAULT_MOTION_BANDS)
     from dense_amv_ctv699 import process_uploaded_sequence
     from himawari_download import download_himawari, list_local_products
     from scene_parts import (MANIFEST_NAME, assemble, load_manifest, parse_manifest,
                              parts_status, save_manifest, save_part, validate_netcdf)
 
     st.subheader("Himawari satellite")
-    st.caption("Two steps: download the full disk to a local folder, then analyse scenes from that folder or an uploaded file.")
+    st.caption("Two steps: load the Himawari full disk and choose its bands, then analyse scenes from that folder or an uploaded file.")
 
     # Restore the last folder chosen in a previous session, without creating
     # anything: a remembered folder that has since moved or become read-only
@@ -660,6 +662,12 @@ def satellite_tab():
             st.session_state["hima_native_unavailable"] = True
             _open_browser()
 
+    def _select_all_bands():
+        st.session_state["himawari_bands"] = list(HIMAWARI_BAND_IDS)
+
+    def _clear_bands():
+        st.session_state["himawari_bands"] = []
+
     def _render_folder_browser():
         current = Path(st.session_state.get("hima_browse_path") or home_folder()).expanduser()
         if not current.is_dir():
@@ -739,10 +747,10 @@ def satellite_tab():
         st.button("Use this folder", key="hima_use_folder_bottom", type="primary",
                   on_click=_remember, args=(str(current),), disabled=bool(problem))
 
-    # ---------------- Step 1: download the full disk ----------------
-    st.markdown("#### Step 1 · Download the full disk to a local folder")
-    with st.expander("JAXA P-Tree download", expanded=False):
-        st.caption("The full-disk NetCDF (about 600 MB per scene) is saved on this machine and kept. Credentials are used for this request only.")
+    # ---------------- Step 1: load the full disk ----------------
+    st.markdown("#### Step 1 · Load Himawari full disk")
+    with st.expander("JAXA P-Tree download", expanded=True):
+        st.caption("Choose the UTC time window, interval and bands. The full-disk NetCDF (about 600 MB per scene) is saved on this machine and kept. Credentials are used for this request only.")
         note = hosted_deployment_note()
         if note:
             st.warning(note)
@@ -752,7 +760,32 @@ def satellite_tab():
         now_utc = datetime.now(timezone.utc).replace(tzinfo=None, second=0, microsecond=0)
         start = c1.datetime_input("Start time (UTC)", value=now_utc)
         end = c2.datetime_input("End time (UTC)", value=now_utc)
-        interval = st.selectbox("Interval (minutes)", [10, 20, 30, 60])
+        interval = st.selectbox(
+            "Interval (minutes)", [10, 20, 30, 60],
+            help="10 minutes matches the standard Himawari full-disk cadence and is required by "
+                 "the dense cloud-motion sequence. Two-scene feature motion works with any "
+                 "interval of 5 minutes or more.",
+        )
+        band_left, band_all, band_clear = st.columns([6, 1, 1], vertical_alignment="bottom")
+        if "himawari_bands" not in st.session_state:
+            st.session_state["himawari_bands"] = list(HIMAWARI_BAND_IDS)
+        with band_left:
+            selected_bands = st.multiselect(
+                "Himawari bands to make available for analysis",
+                options=list(HIMAWARI_BAND_IDS),
+                format_func=HIMAWARI_BAND_LABELS.get,
+                key="himawari_bands",
+                help="All 16 AHI bands are stored in every JAXA R21 full-disk file. "
+                     "This selection controls which bands Step 2 offers for plotting and motion.",
+            )
+        band_all.button("All 16", key="hima_bands_all", on_click=_select_all_bands,
+                        use_container_width=True)
+        band_clear.button("Clear", key="hima_bands_clear", on_click=_clear_bands,
+                          use_container_width=True)
+        if not selected_bands:
+            st.warning("No bands selected. Step 2 will fall back to Band 13; select bands above to analyse others.")
+        else:
+            st.caption(f"{len(selected_bands)} band(s) selected. Each JAXA file still contains all 16 bands.")
         c1, c2 = st.columns([4, 1], vertical_alignment="bottom")
         output_dir = c1.text_input("Local output folder (type a path or browse)",
                                    key="hima_output_dir_text")
@@ -791,7 +824,14 @@ def satellite_tab():
                     st.error(f"Download failed: {exc}")
 
     # ---------------- Step 2: analyse scenes ----------------
-    st.markdown("#### Step 2 · Analyse scenes from the local folder or an upload")
+    st.markdown("#### Step 2 · Analyse Himawari scenes")
+    available_bands = [band for band in selected_bands if band in HIMAWARI_BAND_VARIABLES]
+    if not available_bands:
+        available_bands = ["B13"]
+    if st.session_state.get("sat_band") not in available_bands:
+        st.session_state["sat_band"] = "B13" if "B13" in available_bands else available_bands[0]
+    st.caption("The band menus below use the Step 1 selection: "
+               + ", ".join(available_bands) + ".")
     root = Path(output_dir).expanduser().resolve()
     inventory = list_local_products(root)
     local_names = [item["name"] for item in inventory["roi"] + inventory["full_disk"]]
@@ -940,7 +980,14 @@ def satellite_tab():
 
     st.markdown("##### Plot one band")
     single = pick_one("Scene", "sat_single")
-    variable = st.text_input("Variable name (optional; auto-selects Band 13)", key="sat_variable")
+    plot_band = st.selectbox("Band", options=available_bands,
+                             format_func=HIMAWARI_BAND_LABELS.get, key="sat_band")
+    with st.expander("Advanced: NetCDF variable override"):
+        variable_override = st.text_input(
+            "Variable name", key="sat_variable",
+            placeholder=HIMAWARI_BAND_VARIABLES[plot_band],
+            help="Leave blank to use the standard variable for the selected band.")
+    variable = (variable_override or "").strip() or HIMAWARI_BAND_VARIABLES[plot_band]
     if st.button("Plot field", key="plot_sat"):
         if not single:
             st.error("Choose a scene first.")
@@ -963,12 +1010,26 @@ def satellite_tab():
                 st.error(f"Satellite plotting failed: {exc}")
 
     st.markdown("##### Two-scene feature-motion approximation")
+    st.caption("Choose two scenes; the interval is read from their filenames (at least 5 minutes).")
     c1, c2 = st.columns(2)
     with c1:
         earlier = pick_one("Earlier scene", "motion_1")
     with c2:
-        later = pick_one("Later scene (10 minutes after)", "motion_2")
-    if st.button("Estimate motion for Bands 3, 7 and 13", key="run_motion"):
+        later = pick_one("Later scene", "motion_2")
+    motion_defaults = [band for band in DEFAULT_MOTION_BANDS if band in available_bands]
+    if not motion_defaults:
+        motion_defaults = available_bands[:1]
+    current_motion = st.session_state.get("sat_motion_bands")
+    if current_motion is None or (current_motion and any(band not in available_bands for band in current_motion)):
+        st.session_state["sat_motion_bands"] = motion_defaults
+    motion_bands = st.multiselect(
+        "Bands for motion", options=available_bands,
+        format_func=HIMAWARI_BAND_LABELS.get, key="sat_motion_bands",
+        help="Defaults to B03, B07 and B13 when available. A band that cannot be tracked "
+             "is reported without stopping the other bands.",
+    )
+    if st.button(f"Estimate feature motion · {len(motion_bands)} band(s)", key="run_motion",
+                 disabled=not motion_bands):
         if not earlier or not later:
             st.error("Choose both scenes.")
         else:
@@ -976,18 +1037,22 @@ def satellite_tab():
                 if use_local and local_region(later[0]) != local_region(earlier[0]):
                     raise ValueError("Choose two scenes of the same kind: both full-disk or both cropped to one box.")
                 with st.spinner("Tracking image features…"):
-                    result = process_motion_files([earlier, later], region=local_region(earlier[0]) if use_local else JUANDA_REGION)
+                    result = process_motion_files([earlier, later], band=tuple(motion_bands),
+                                                  region=local_region(earlier[0]) if use_local else JUANDA_REGION)
                 st.session_state["comprehensive_satellite_motion"] = {
                     "files": [earlier[0], later[0]],
                     "bands": [{k: v for k, v in band.items() if k not in ("preview",)} for band in result.get("bands", [])],
+                    "failures": result.get("failures", []),
                     "caveat": result.get("caveat", ""),
                 }
                 st.warning(result["caveat"])
                 for band in result["bands"]:
-                    st.markdown(f"**Band {band['band']} · {band['variable']} · {band['time_delta_minutes']} minute interval**")
+                    st.markdown(f"**Band B{band['band']:02d} · {band['variable']} · {band['time_delta_minutes']:g}-minute interval**")
                     show_b64_image(band["preview"]["png_base64"])
                     st.json({k: v for k, v in band.items() if k not in ("preview", "caveat")})
                     st.caption(band["caveat"])
+                for failure in result.get("failures", []):
+                    st.info(f"Band B{failure['band']:02d} ({failure['variable']}): {failure['error']}")
             except Exception as exc:
                 st.error(f"Motion estimate failed: {exc}")
 
