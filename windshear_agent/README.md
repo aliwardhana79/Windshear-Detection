@@ -38,6 +38,36 @@ The tab runs in two explicit steps:
 
 **Where downloads are saved.** The folder is always on the machine that runs this app. On a hosted deployment (for example Streamlit Community Cloud) that is the server container, not the computer you view the page from: the displayed folder is a server path such as `/tmp/Himawari_9`, the ~600 MB scenes use the server's ephemeral disk, and they are lost when the app restarts. To save into a folder on your own Mac or Windows PC, run `streamlit run streamlit_app.py` on that computer and open `http://localhost:8501`.
 
+### Save scenes to Google Drive (optional)
+
+A Google Drive copy keeps a hosted download after the container restarts. The local file is always kept for Step 2; Drive receives a second copy, and a failed upload never deletes the local scene. On a hosted deployment the local copy still uses the container's ephemeral disk, so keep the requested time window small; the first 600 MB upload can take several minutes.
+
+**Set up OAuth (recommended)**
+
+1. In [Google Cloud Console](https://console.cloud.google.com/), create or select a project and enable the **Google Drive API**.
+2. Configure the **OAuth consent screen**. *External* is fine for a personal account; add your Google address as a test user while the app is unpublished.
+3. Open **Credentials → Create credentials → OAuth client ID**, choose **Desktop app**, and download the client JSON.
+4. On your own computer, in this folder, run:
+   ```bash
+   pip install google-auth-oauthlib google-api-python-client
+   python gdrive_setup.py --client-secrets client_secret_XXXX.json
+   ```
+   Sign in with the Google account that should receive the scenes. The script prints a `[gdrive]` block containing `client_id`, `client_secret` and `refresh_token`.
+5. Paste that block into `.streamlit/secrets.toml` for a local run, or into the Streamlit Cloud app under **Settings → Secrets**. Start from `secrets.toml.example`.
+6. Reboot the app. A **Test Google Drive connection** button appears in Step 1.
+
+The app requests the non-sensitive `drive.file` scope. It creates or reuses a folder named `Himawari_9` in **My Drive**, and it can only see and manage files that it created itself.
+
+**Using it**
+
+- In **Step 1**, tick **Copy downloaded scenes to Google Drive**. After the JAXA download, each new full-disk scene is uploaded in resumable 8 MB chunks with progress and a Drive link.
+- In **Step 2**, open **Google Drive · save a local scene** to copy scenes already on disk, including a full disk assembled from parts.
+- Files with the same name and byte size are skipped; a changed file is updated in place instead of duplicated.
+
+**Service account alternative.** Create a service account, share a destination folder with its email as **Editor**, and put `service_account_json` (the whole JSON) plus `folder_id` in the `[gdrive]` block; see `secrets.toml.example`. A Google Workspace **Shared Drive** is recommended, because a service account has no storage quota of its own and a personal My Drive folder can fail with `storageQuotaExceeded`.
+
+Keep `.streamlit/secrets.toml` private; it is listed in `.gitignore`. Google Drive is entirely optional — without credentials the rest of the app works unchanged.
+
 ### Upload a full disk to a hosted app in parts
 
 Community Cloud rejects a single ~600 MB browser upload. To analyse a full disk there without running the app locally:
@@ -46,7 +76,7 @@ Community Cloud rejects a single ~600 MB browser upload. To analyse a full disk 
 2. In **Satellite Analyze → Step 2**, open **Large scene · upload a full disk in parts**. Upload `manifest.json`, then each `.part` file one at a time. Each part is checked with SHA-256 as it arrives; the panel shows how many parts and megabytes are still missing.
 3. When all parts are present, press **Assemble full disk**. The parts are joined into the output folder, the full-file checksum is verified, the NetCDF is opened once to confirm it has latitude/longitude fields, and the scene appears in the local scene list.
 
-The parts and the assembled scene live on the server's temporary disk. The panel shows the free space before you upload; about 0.8 GB is needed for one 600 MB scene. A container restart loses the parts, in which case you upload them again. This workflow moves the whole file through several smaller requests — it does not make the scene persist on your PC, and it does not bypass the server's disk limit.
+The parts and the assembled scene live on the server's temporary disk. The panel shows the free space before you upload; about 0.8 GB is needed for one 600 MB scene. A container restart loses the parts, in which case you upload them again. This workflow moves the whole file through several smaller requests — it does not make the scene persist on your PC, and it does not bypass the server's disk limit. After assembly, use **Google Drive · save a local scene** if you need the file to outlive the container.
 
 ### Run on Windows (to save into `C:\`)
 
